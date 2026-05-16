@@ -21,7 +21,7 @@ struct ClmReader: View {
     @State private var selectedDeviceUUID: String?
     @State private var shouldExportAfterDismiss = false
 
-    @State private var chartStartDate = Date().addingTimeInterval(-86400 * 7)
+    @State private var chartStartDate = Date().addingTimeInterval(-43200)
     @State private var chartEndDate = Date()
     @State private var showChartTimePicker = false
     @State private var showManualSyncSheet = false
@@ -107,9 +107,11 @@ struct ClmReader: View {
 
                 Button {
                     endPinned = false
+                    chartStartDate = Date().addingTimeInterval(-43200)
+                    chartEndDate = Date()
                     rebuildDisplayData()
                 } label: {
-                    Text("Live Mode (No End Limit)")
+                    Text("Live Mode (Last 12 Hours)")
                         .font(.subheadline)
                         .foregroundColor(.white)
                         .padding(6)
@@ -166,8 +168,8 @@ struct ClmReader: View {
                 .navigationTitle("Chart Time Filter")
                 .toolbar {
                     ToolbarItem(placement: .navigationBarLeading) {
-                        Button("Reset Live") {
-                            chartStartDate = Date().addingTimeInterval(-86400 * 7)
+                        Button("Reset 12h") {
+                            chartStartDate = Date().addingTimeInterval(-43200)
                             chartEndDate = Date()
                             endPinned = false
                             showChartTimePicker = false
@@ -276,9 +278,14 @@ struct ClmReader: View {
             rebuildDisplayData()
         }
         .onChange(of: ble.connectedPeripheralUUID) { _ in
+            chartStartDate = Date().addingTimeInterval(-43200)
+            chartEndDate = Date()
+            endPinned = false
             rebuildDisplayData()
         }
         .onAppear {
+            chartStartDate = Date().addingTimeInterval(-43200)
+            chartEndDate = Date()
             endPinned = false
             rebuildDisplayData()
         }
@@ -296,7 +303,7 @@ struct ClmReader: View {
             if endPinned {
                 return item.timestamp <= chartEndDate
             } else {
-                return true
+                return item.timestamp <= Date()
             }
         }
         .sorted { $0.timestamp < $1.timestamp }
