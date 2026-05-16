@@ -26,6 +26,7 @@ struct ClmReader: View {
     @State private var showChartTimePicker = false
     @State private var showManualSyncSheet = false
     @State private var manualSyncSeqInput = ""
+    @State private var showClearHistoryAlert = false
 
     @State private var endPinned = false
 
@@ -47,21 +48,34 @@ struct ClmReader: View {
                 .foregroundColor(.green)
 
             if ble.connectedPeripheralUUID != nil {
-                Button {
-                    if let currentUUID = ble.connectedPeripheralUUID {
-                        let suggested = ble.nextMissingSeq(for: currentUUID)
-                        manualSyncSeqInput = suggested.map(String.init) ?? ""
-                    } else {
-                        manualSyncSeqInput = ""
+                HStack(spacing: 10) {
+                    Button {
+                        if let currentUUID = ble.connectedPeripheralUUID {
+                            let suggested = ble.nextMissingSeq(for: currentUUID)
+                            manualSyncSeqInput = suggested.map(String.init) ?? ""
+                        } else {
+                            manualSyncSeqInput = ""
+                        }
+                        showManualSyncSheet = true
+                    } label: {
+                        Text("Sync History")
+                            .font(.subheadline)
+                            .foregroundColor(.white)
+                            .padding(6)
+                            .background(Color.purple)
+                            .cornerRadius(8)
                     }
-                    showManualSyncSheet = true
-                } label: {
-                    Text("Sync History")
-                        .font(.subheadline)
-                        .foregroundColor(.white)
-                        .padding(6)
-                        .background(Color.purple)
-                        .cornerRadius(8)
+
+                    Button {
+                        showClearHistoryAlert = true
+                    } label: {
+                        Text("Clear History")
+                            .font(.subheadline)
+                            .foregroundColor(.white)
+                            .padding(6)
+                            .background(Color.red)
+                            .cornerRadius(8)
+                    }
                 }
 
                 Button {
@@ -190,6 +204,15 @@ struct ClmReader: View {
                 }
             }
             .presentationDetents([.medium])
+        }
+        .alert("Clear This Device History?", isPresented: $showClearHistoryAlert) {
+            Button("Cancel", role: .cancel) {}
+            Button("Clear", role: .destructive) {
+                ble.clearHistoryForConnectedDevice()
+                rebuildDisplayData()
+            }
+        } message: {
+            Text("This will remove all stored history samples for the currently connected device.")
         }
         .onChange(of: showExportSheet) { val in
             if !val && shouldExportAfterDismiss {
@@ -586,6 +609,22 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
         }
 
         return (seqs.last ?? 0) + 1
+    }
+
+    func clearHistoryForConnectedDevice() {
+        guard let deviceUUID = connectedPeripheralUUID else { return }
+        historyData.removeAll { $0.deviceUUID == deviceUUID }
+        lastSeqs.removeValue(forKey: deviceUUID)
+        activationTimes.removeValue(forKey: deviceUUID)
+        lactate = "0.00 mmol/L"
+        rawData = "Waiting data..."
+        status = "History cleared for current device"
+        isBackfillingHistory = false
+        backfillStartSeq = nil
+        backfillTargetSeq = nil
+        lastRequestedHistorySeq = nil
+        lastReceivedHistorySeq = nil
+        backfillRetryCount = 0
     }
 
     private func firstMissingSeq(in sortedSeqs: [Int]) -> Int? {
