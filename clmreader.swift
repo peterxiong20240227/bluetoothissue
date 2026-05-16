@@ -45,63 +45,15 @@ struct ClmReader: View {
                 .foregroundColor(.green)
 
             if ble.connectedPeripheralUUID != nil {
-                HStack(spacing: 10) {
-                    Button {
-                        ble.manualSyncHistory()
-                    } label: {
-                        Text("Sync History")
-                            .font(.subheadline)
-                            .foregroundColor(.white)
-                            .padding(6)
-                            .background(Color.purple)
-                            .cornerRadius(8)
-                    }
-
-                    Button {
-                        ble.toggleRawSendPanel()
-                    } label: {
-                        Text("Send Raw")
-                            .font(.subheadline)
-                            .foregroundColor(.white)
-                            .padding(6)
-                            .background(Color.gray)
-                            .cornerRadius(8)
-                    }
-                }
-
-                if ble.showRawSendPanel {
-                    VStack(spacing: 8) {
-                        Text("Raw Hex (spaces ok, no 0x prefix)")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-
-                        TextField("e.g. eb 90 00 04 ... 0d 0a", text: $ble.rawHexToSend)
-                            .textInputAutocapitalization(.never)
-                            .disableAutocorrection(true)
-                            .textFieldStyle(.roundedBorder)
-                            .font(.system(size: 12, design: .monospaced))
-
-                        HStack(spacing: 10) {
-                            Button("Send") {
-                                ble.sendRawHexFromUI()
-                            }
-                            .padding(.horizontal, 10)
-                            .padding(.vertical, 6)
-                            .background(Color.black)
-                            .foregroundColor(.white)
-                            .cornerRadius(8)
-
-                            Button("Fill: History startSeq=0") {
-                                ble.fillRawHexHistoryStart0()
-                            }
-                            .padding(.horizontal, 10)
-                            .padding(.vertical, 6)
-                            .background(Color.blue)
-                            .foregroundColor(.white)
-                            .cornerRadius(8)
-                        }
-                    }
-                    .padding(.horizontal)
+                Button {
+                    ble.manualSyncHistory()
+                } label: {
+                    Text("Sync History")
+                        .font(.subheadline)
+                        .foregroundColor(.white)
+                        .padding(6)
+                        .background(Color.purple)
+                        .cornerRadius(8)
                 }
 
                 Button {
@@ -274,7 +226,6 @@ struct ClmReader: View {
                 shouldExportAfterDismiss = false
             }
         } catch {
-            print("Export Error: \(error)")
             shouldExportAfterDismiss = false
         }
     }
@@ -532,9 +483,6 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
     @Published var connectedPeripheralUUID: String? = nil
     @Published var connectedPeripheralName: String? = nil
 
-    @Published var showRawSendPanel: Bool = false
-    @Published var rawHexToSend: String = ""
-
     private var central: CBCentralManager!
     private var notifyPeripheral: CBPeripheral?
     private var notifyCharacteristic: CBCharacteristic?
@@ -557,60 +505,6 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
         loadActivationTimes()
         loadLastSeqs()
         rebuildLastSeqsFromHistoryIfNeeded()
-        print("[BLE] Manager initialized. history count=\(historyData.count), activationTimes=\(activationTimes.count), lastSeqs=\(lastSeqs.count)")
-    }
-
-    func toggleRawSendPanel() {
-        showRawSendPanel.toggle()
-        print("[BLE] toggleRawSendPanel => \(showRawSendPanel)")
-    }
-
-    func sendRawHexFromUI() {
-        sendRawHex(rawHexToSend)
-    }
-
-    func fillRawHexHistoryStart0() {
-        let pkt = buildHistoryRequestPacket(startSeq: 0)
-        rawHexToSend = pkt.map { String(format: "%02x", $0) }.joined(separator: " ")
-        print("[BLE] fillRawHexHistoryStart0 => \(rawHexToSend)")
-    }
-
-    func sendRawHex(_ hex: String) {
-        guard let peripheral = notifyPeripheral, let writeCharacteristic else {
-            print("[BLE] sendRawHex aborted: missing peripheral or writeCharacteristic")
-            status = "Raw send failed: write not ready"
-            return
-        }
-
-        let cleaned = hex
-            .replacingOccurrences(of: "0x", with: "")
-            .replacingOccurrences(of: " ", with: "")
-            .replacingOccurrences(of: "\n", with: "")
-            .replacingOccurrences(of: "\t", with: "")
-
-        guard cleaned.count % 2 == 0, !cleaned.isEmpty else {
-            print("[BLE] sendRawHex invalid hex length")
-            status = "Raw send failed: invalid hex"
-            return
-        }
-
-        var bytes: [UInt8] = []
-        bytes.reserveCapacity(cleaned.count / 2)
-        var idx = cleaned.startIndex
-        while idx < cleaned.endIndex {
-            let next = cleaned.index(idx, offsetBy: 2)
-            let byteStr = String(cleaned[idx..<next])
-            guard let b = UInt8(byteStr, radix: 16) else {
-                print("[BLE] sendRawHex invalid byte: \(byteStr)")
-                status = "Raw send failed: invalid byte"
-                return
-            }
-            bytes.append(b)
-            idx = next
-        }
-
-        print("[BLE] sendRawHex => \(bytes.map { String(format: "%02x", $0) }.joined(separator: " "))")
-        peripheral.writeValue(Data(bytes), for: writeCharacteristic, type: .withResponse)
     }
 
     func getAvailableDevices() -> [(uuid: String, name: String)] {
@@ -624,49 +518,37 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
     private func saveToLocal() {
         if let data = try? JSONEncoder().encode(historyData) {
             UserDefaults.standard.set(data, forKey: storageKey)
-            print("[BLE] saveToLocal history count=\(historyData.count)")
         }
     }
 
     private func loadFromLocal() {
         guard let data = UserDefaults.standard.data(forKey: storageKey) else {
-            print("[BLE] loadFromLocal no existing history")
             return
         }
         if let arr = try? JSONDecoder().decode([DataPoint].self, from: data) {
             historyData = arr
-            print("[BLE] loadFromLocal loaded history count=\(arr.count)")
-        } else {
-            print("[BLE] loadFromLocal decode failed")
         }
     }
 
     private func saveActivationTimes() {
         let dict = activationTimes.mapValues { $0.timeIntervalSince1970 }
         UserDefaults.standard.set(dict, forKey: activationStorageKey)
-        print("[BLE] saveActivationTimes count=\(activationTimes.count)")
     }
 
     private func loadActivationTimes() {
         guard let dict = UserDefaults.standard.dictionary(forKey: activationStorageKey) as? [String: TimeInterval] else {
-            print("[BLE] loadActivationTimes empty")
             return
         }
         activationTimes = dict.mapValues { Date(timeIntervalSince1970: $0) }
-        print("[BLE] loadActivationTimes loaded count=\(activationTimes.count)")
     }
 
     private func saveLastSeqs() {
         UserDefaults.standard.set(lastSeqs, forKey: lastSeqStorageKey)
-        print("[BLE] saveLastSeqs count=\(lastSeqs.count) value=\(lastSeqs)")
     }
 
     private func loadLastSeqs() {
         if let dict = UserDefaults.standard.dictionary(forKey: lastSeqStorageKey) as? [String: Int] {
             lastSeqs = dict
-            print("[BLE] loadLastSeqs loaded=\(dict)")
-        } else {
-            print("[BLE] loadLastSeqs empty")
         }
     }
 
@@ -675,13 +557,11 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
             guard let seq = item.seq else { continue }
             lastSeqs[item.deviceUUID] = max(lastSeqs[item.deviceUUID] ?? seq, seq)
         }
-        print("[BLE] rebuildLastSeqsFromHistoryIfNeeded => \(lastSeqs)")
     }
 
     func startScan() {
         foundDevices.removeAll()
         status = "Scanning..."
-        print("[BLE] startScan withServices=nil")
         central.scanForPeripherals(withServices: nil, options: [CBCentralManagerScanOptionAllowDuplicatesKey: false])
     }
 
@@ -698,15 +578,12 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
         writeCharacteristic = nil
         didTriggerInitialSyncForCurrentConnection = false
 
-        print("[BLE] connect peripheral name=\(peripheral.name ?? "nil") uuid=\(peripheral.identifier.uuidString)")
         central.connect(peripheral)
     }
 
     func manualSyncHistory() {
-        print("[BLE] manualSyncHistory called. peripheralReady=\(notifyPeripheral != nil) writeReady=\(writeCharacteristic != nil) notifyReady=\(notifyCharacteristic != nil)")
         guard notifyPeripheral != nil, writeCharacteristic != nil else {
             status = "Sync failed: write channel not ready"
-            print("[BLE] manualSyncHistory aborted: write channel not ready")
             return
         }
 
@@ -722,28 +599,23 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
 
     func centralManagerDidUpdateState(_ central: CBCentralManager) {
         status = central.state == .poweredOn ? "Bluetooth ON → Ready" : "Bluetooth NOT Available"
-        print("[BLE] central state updated => \(central.state.rawValue) status=\(status)")
     }
 
     func centralManager(_ central: CBCentralManager, didDiscover peripheral: CBPeripheral, advertisementData: [String : Any], rssi RSSI: NSNumber) {
-        print("[BLE] didDiscover name=\(peripheral.name ?? "nil") uuid=\(peripheral.identifier.uuidString) rssi=\(RSSI) adv=\(advertisementData)")
         guard let name = peripheral.name, !name.isEmpty else { return }
         if name.starts(with: "Eaglenos") {
             if !foundDevices.contains(where: { $0.identifier == peripheral.identifier }) {
                 foundDevices.append(peripheral)
-                print("[BLE] added found device => \(name)")
             }
         }
     }
 
     func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
         status = "Connected: \(peripheral.name ?? "Device")"
-        print("[BLE] didConnect name=\(peripheral.name ?? "nil") uuid=\(peripheral.identifier.uuidString)")
         peripheral.discoverServices([targetServiceUUID])
     }
 
     func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?) {
-        print("[BLE] didDisconnect name=\(peripheral.name ?? "nil") uuid=\(peripheral.identifier.uuidString) error=\(String(describing: error))")
         if connectedPeripheralUUID == peripheral.identifier.uuidString {
             connectedPeripheralUUID = nil
             connectedPeripheralName = nil
@@ -758,44 +630,32 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
     func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
         if let error {
             status = "Discover services error: \(error.localizedDescription)"
-            print("[BLE] didDiscoverServices error=\(error)")
             return
         }
         guard let services = peripheral.services else {
-            print("[BLE] didDiscoverServices no services")
             return
         }
-        print("[BLE] didDiscoverServices count=\(services.count)")
-        for s in services {
-            print("[BLE] service => \(s.uuid.uuidString)")
-            if s.uuid == targetServiceUUID {
-                peripheral.discoverCharacteristics([notifyCharUUID, writeCharUUID], for: s)
-            }
+        for s in services where s.uuid == targetServiceUUID {
+            peripheral.discoverCharacteristics([notifyCharUUID, writeCharUUID], for: s)
         }
     }
 
     func peripheral(_ peripheral: CBPeripheral, didDiscoverCharacteristicsFor service: CBService, error: Error?) {
         if let error {
             status = "Discover chars error: \(error.localizedDescription)"
-            print("[BLE] didDiscoverCharacteristics error=\(error)")
             return
         }
         guard let chars = service.characteristics else {
-            print("[BLE] didDiscoverCharacteristics no chars for service=\(service.uuid.uuidString)")
             return
         }
 
-        print("[BLE] didDiscoverCharacteristics service=\(service.uuid.uuidString) count=\(chars.count)")
         for c in chars {
-            print("[BLE] char => uuid=\(c.uuid.uuidString) properties=\(c.properties.rawValue)")
             if c.uuid == notifyCharUUID {
                 notifyCharacteristic = c
                 peripheral.setNotifyValue(true, for: c)
-                print("[BLE] subscribe notify char => \(c.uuid.uuidString)")
             }
             if c.uuid == writeCharUUID {
                 writeCharacteristic = c
-                print("[BLE] found write char => \(c.uuid.uuidString)")
             }
         }
 
@@ -805,56 +665,40 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
     func peripheral(_ peripheral: CBPeripheral, didUpdateNotificationStateFor characteristic: CBCharacteristic, error: Error?) {
         if let error {
             status = "Notify failed: \(error.localizedDescription)"
-            print("[BLE] didUpdateNotificationState error for \(characteristic.uuid.uuidString) => \(error)")
             return
         }
         status = characteristic.isNotifying ? "Notify ON" : "Notify OFF"
-        print("[BLE] notify state for \(characteristic.uuid.uuidString) => \(characteristic.isNotifying)")
         triggerInitialHistorySyncIfReady()
     }
 
     func peripheral(_ peripheral: CBPeripheral, didWriteValueFor characteristic: CBCharacteristic, error: Error?) {
         if let error {
-            print("[BLE] didWriteValue error for \(characteristic.uuid.uuidString) => \(error)")
-        } else {
-            print("[BLE] didWriteValue success for \(characteristic.uuid.uuidString)")
+            status = "Write failed: \(error.localizedDescription)"
         }
     }
 
     func peripheral(_ peripheral: CBPeripheral, didUpdateValueFor characteristic: CBCharacteristic, error: Error?) {
         if let error {
-            print("[BLE] didUpdateValue error: \(error)")
             return
         }
 
         guard characteristic.uuid == notifyCharacteristic?.uuid else {
-            print("[BLE] didUpdateValue ignored non-notify char=\(characteristic.uuid.uuidString)")
             return
         }
         guard let data = characteristic.value else {
-            print("[BLE] didUpdateValue empty data")
             return
         }
 
         let byteArray = [UInt8](data)
         rawData = byteArray.map { String(format: "%02x ", $0) }.joined()
 
-        let hex = byteArray.map { String(format: "%02x", $0) }.joined(separator: " ")
-        print("[BLE] notify <= \(hex)")
-        print("[BLE] notify checksum valid => \(validateChecksum(byteArray))")
-
         let fullDeviceName = peripheral.name ?? "Unknown Device"
         let deviceUUID = peripheral.identifier.uuidString
 
         if isHistoryPacket(byteArray) {
-            print("[BLE] packet classified as HISTORY")
             handleHistoryPacket(byteArray, deviceName: fullDeviceName, deviceUUID: deviceUUID)
         } else if isRealtimePacket(byteArray) {
-            print("[BLE] packet classified as REALTIME")
             handleRealtimePacket(byteArray, deviceName: fullDeviceName, deviceUUID: deviceUUID)
-        } else {
-            print("[BLE] packet classified as ACK/STATUS")
-            parseAckOrStatusPacket(byteArray)
         }
     }
 
@@ -875,40 +719,16 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
         return len == 0x0019
     }
 
-    private func parseAckOrStatusPacket(_ bytes: [UInt8]) {
-        guard bytes.count >= 6 else { return }
-        let packetType = Int(bytes[2]) << 8 | Int(bytes[3])
-        let len = Int(bytes[4]) << 8 | Int(bytes[5])
-
-        var expected: Int? = nil
-        if bytes.count >= 4 {
-            expected = Int(bytes[bytes.count - 4]) * 256 + Int(bytes[bytes.count - 3])
-        }
-
-        let payload = Array(bytes.dropFirst(6).dropLast(4))
-        let payloadHex = payload.map { String(format: "%02x", $0) }.joined(separator: " ")
-
-        print("[BLE] ACK/STATUS packet: type=0x\(String(format: "%04X", packetType)) len=0x\(String(format: "%04X", len)) payload=\(payloadHex) checksum=\(expected.map { String(format: "0x%04X", $0) } ?? "nil")")
-
-        if payload.count >= 2 {
-            let cmd = Int(payload[0])
-            let sub = Int(payload[1])
-            print("[BLE] ACK/STATUS decode guess: cmd=0x\(String(format: "%02X", cmd)) sub=0x\(String(format: "%02X", sub))")
-        }
-    }
-
     // MARK: - Realtime / History handling
 
     private func handleRealtimePacket(_ bytes: [UInt8], deviceName: String, deviceUUID: String) {
         guard bytes.count >= 11 else {
-            print("[BLE] handleRealtimePacket ignored, too short count=\(bytes.count)")
             return
         }
 
         let rawVal = Int(bytes[7]) * 256 + Int(bytes[8])
         let value = Float(rawVal) / 100.0
         let seq = parseRealtimeSeq(from: bytes)
-        print("[BLE] realtime parsed value=\(value) seq=\(String(describing: seq)) device=\(deviceName)")
 
         DispatchQueue.main.async {
             self.connectedPeripheralUUID = deviceUUID
@@ -920,7 +740,6 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
                 let interval = self.deviceInterval(for: deviceName)
                 let activation = Date().addingTimeInterval(-TimeInterval(seq) * interval.secondsPerSample)
                 self.activationTimes[deviceUUID] = activation
-                print("[BLE] inferred activation time for \(deviceUUID) => \(activation) from seq=\(seq)")
                 self.recomputeTimestamps(for: deviceUUID, deviceName: deviceName)
             }
 
@@ -932,39 +751,29 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
 
     private func handleHistoryPacket(_ bytes: [UInt8], deviceName: String, deviceUUID: String) {
         guard bytes.count > 13 else {
-            print("[BLE] handleHistoryPacket ignored, too short count=\(bytes.count)")
             return
         }
 
         let payload = Array(bytes.dropFirst(6).dropLast(4))
         guard payload.count > 3 else {
-            print("[BLE] handleHistoryPacket empty payload after trimming")
             return
         }
 
-        let pageHeader = Array(payload.prefix(3))
         let body = Array(payload.dropFirst(3))
         let recordSize = 16
         let recordCount = body.count / recordSize
-
-        print("[BLE] history page header=\(pageHeader.map { String(format: "%02x", $0) }.joined(separator: " ")) payloadLength=\(payload.count) bodyLength=\(body.count) recordSize=\(recordSize) recordCount=\(recordCount)")
         guard recordCount > 0 else { return }
 
         var points: [DataPoint] = []
         for i in 0..<recordCount {
             let start = i * recordSize
             let rec = Array(body[start..<(start + recordSize)])
-            let recHex = rec.map { String(format: "%02x", $0) }.joined(separator: " ")
 
             let seq = Int(rec[0]) * 256 + Int(rec[1])
-            let candidate1 = Int(rec[2]) * 256 + Int(rec[3])
-            let candidate2 = Int(rec[4]) * 256 + Int(rec[5])
-            let candidate3 = Int(rec[10]) * 256 + Int(rec[11])
-            let candidate4 = Int(rec[14]) * 256 + Int(rec[15])
-            let value = Float(candidate4) / 100.0
+            let rawValue = Int(rec[14]) * 256 + Int(rec[15])
+            let value = Float(rawValue) / 100.0
             let timestamp = computeTimestamp(deviceUUID: deviceUUID, deviceName: deviceName, receiveTime: Date(), seq: seq)
 
-            print("[BLE] history rec[\(i)] raw=\(recHex) seq=\(seq) c1=\(candidate1) c2=\(candidate2) c3=\(candidate3) c4=\(candidate4) chosen=\(candidate4) value=\(value) timestamp=\(timestamp)")
             points.append(DataPoint(value: value, timestamp: timestamp, deviceName: deviceName, deviceUUID: deviceUUID, seq: seq))
         }
 
@@ -982,24 +791,19 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
     private func upsert(_ point: DataPoint) {
         if let seq = point.seq,
            let idx = historyData.firstIndex(where: { $0.deviceUUID == point.deviceUUID && $0.seq == seq }) {
-            print("[BLE] upsert replace existing seq=\(seq) for device=\(point.deviceUUID)")
             historyData[idx] = point
         } else {
-            print("[BLE] upsert append seq=\(String(describing: point.seq)) value=\(point.value) time=\(point.timestamp)")
             historyData.append(point)
         }
 
         if let seq = point.seq {
-            let old = lastSeqs[point.deviceUUID]
             lastSeqs[point.deviceUUID] = max(lastSeqs[point.deviceUUID] ?? seq, seq)
-            print("[BLE] lastSeq update device=\(point.deviceUUID) old=\(String(describing: old)) new=\(String(describing: lastSeqs[point.deviceUUID]))")
         }
     }
 
     // MARK: - History sync
 
     private func triggerInitialHistorySyncIfReady() {
-        print("[BLE] triggerInitialHistorySyncIfReady called triggered=\(didTriggerInitialSyncForCurrentConnection) peripheralReady=\(notifyPeripheral != nil) notifyReady=\(notifyCharacteristic != nil) writeReady=\(writeCharacteristic != nil) notifyOn=\(notifyCharacteristic?.isNotifying ?? false)")
         guard !didTriggerInitialSyncForCurrentConnection else { return }
         guard let peripheral = notifyPeripheral,
               let notifyCharacteristic,
@@ -1011,7 +815,6 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
 
         didTriggerInitialSyncForCurrentConnection = true
         status = "Syncing device time and history..."
-        print("[BLE] auto history sync starting using writeChar=\(writeCharacteristic.uuid.uuidString)")
 
         sendSetTime()
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
@@ -1024,11 +827,9 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
 
     private func sendSetTime() {
         guard let peripheral = notifyPeripheral, let writeCharacteristic else {
-            print("[BLE] sendSetTime aborted: missing peripheral or writeCharacteristic")
             return
         }
         let packet = buildSetTimePacket(date: Date())
-        print("[BLE] sendSetTime => \(packet.map { String(format: "%02x", $0) }.joined(separator: " "))")
         let data = Data(packet)
         peripheral.writeValue(data, for: writeCharacteristic, type: .withResponse)
     }
@@ -1037,7 +838,6 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
         guard let peripheral = notifyPeripheral,
               let writeCharacteristic,
               let deviceUUID = connectedPeripheralUUID else {
-            print("[BLE] sendHistoryRequest aborted: missing peripheral/writeCharacteristic/deviceUUID")
             return
         }
 
@@ -1051,19 +851,16 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
         }
 
         let packet = buildHistoryRequestPacket(startSeq: startSeq)
-        print("[BLE] sendHistoryRequest startSeq=\(startSeq) => \(packet.map { String(format: "%02x", $0) }.joined(separator: " "))")
         let data = Data(packet)
         peripheral.writeValue(data, for: writeCharacteristic, type: .withResponse)
     }
 
     private func sendHistoryStreamStart() {
         guard let peripheral = notifyPeripheral, let writeCharacteristic else {
-            print("[BLE] sendHistoryStreamStart aborted: missing peripheral or writeCharacteristic")
             return
         }
 
         let packet = buildHistoryStreamStartPacket()
-        print("[BLE] sendHistoryStreamStart => \(packet.map { String(format: "%02x", $0) }.joined(separator: " "))")
         peripheral.writeValue(Data(packet), for: writeCharacteristic, type: .withResponse)
     }
 
@@ -1167,7 +964,6 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
             guard let seq = historyData[idx].seq else { continue }
             historyData[idx].timestamp = activation.addingTimeInterval(TimeInterval(seq) * interval.secondsPerSample)
         }
-        print("[BLE] recomputeTimestamps completed for device=\(deviceUUID)")
     }
 
     private func parseRealtimeSeq(from bytes: [UInt8]) -> Int? {
