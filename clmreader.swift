@@ -725,6 +725,20 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
             .max()
     }
 
+    private func maxStoredSeq(for deviceUUID: String, excluding seqToIgnore: Int?) -> Int? {
+        historyData
+            .filter { item in
+                guard item.deviceUUID == deviceUUID else { return false }
+                guard let seq = item.seq else { return false }
+                if let seqToIgnore {
+                    return seq != seqToIgnore
+                }
+                return true
+            }
+            .compactMap { $0.seq }
+            .max()
+    }
+
     private func removeLegacyHistoryBlobIfNeeded() {
         let defaults = UserDefaults.standard
         if defaults.object(forKey: legacyHistoryStorageKey) != nil {
@@ -1006,6 +1020,7 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
         let rawVal = Int(bytes[7]) * 256 + Int(bytes[8])
         let value = Float(rawVal) / 100.0
         let seq = parseRealtimeSeq(from: bytes)
+        let previousMaxSeq = maxStoredSeq(for: deviceUUID, excluding: seq)
 
         DispatchQueue.main.async {
             self.connectedPeripheralUUID = deviceUUID
@@ -1023,7 +1038,7 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
             let timestamp = self.computeTimestamp(deviceUUID: deviceUUID, deviceName: deviceName, receiveTime: Date(), seq: seq)
             let point = DataPoint(value: value, timestamp: timestamp, deviceName: deviceName, deviceUUID: deviceUUID, seq: seq)
             self.upsert(point)
-            self.requestMissingHistoryIfNeeded(for: deviceUUID)
+            self.requestMissingHistoryIfNeeded(for: deviceUUID, realtimeSeq: seq, previousMaxSeq: previousMaxSeq)
         }
     }
 
@@ -1120,23 +1135,15 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
         }
     }
 
-    private func requestMissingHistoryIfNeeded(for deviceUUID: String) {
+    private func requestMissingHistoryIfNeeded(for deviceUUID: String, realtimeSeq: Int?, previousMaxSeq: Int?) {
         guard !isBackfillingHistory else { return }
+        guard let realtimeSeq else { return }
+        guard let previousMaxSeq else { return }
+        guard realtimeSeq > previousMaxSeq + 1 else { return }
 
-        let seqs = historyData
-            .filter { $0.deviceUUID == deviceUUID }
-            .compactMap { $0.seq }
-            .sorted()
-
-        guard let missing = firstMissingSeq(in: seqs) else {
-            return
-        }
-
-        guard let latest = seqs.max(), latest > missing else {
-            return
-        }
-
-        manualSyncHistory(startSeq: missing)
+        let missingStartSeq = previousMaxSeq + 1
+        status = "Realtime gap detected, syncing history from seq \(missingStartSeq)"
+        manualSyncHistory(startSeq: missingStartSeq)
     }
 
     private func requestHistoryPage(from startSeq: Int) {
@@ -1158,8 +1165,7 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
 
         _ = writeCharacteristic
         didTriggerInitialSyncForCurrentConnection = true
-        status = "Syncing device time and history..."
-        manualSyncHistory(startSeq: nil)
+        status = "Connected and ready"
     }
 
     private func sendSetTime() {
