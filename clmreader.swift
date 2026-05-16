@@ -865,7 +865,7 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
         guard bytes[0] == 0xEB, bytes[1] == 0x90 else { return false }
         let type = Int(bytes[2]) << 8 | Int(bytes[3])
         let len = Int(bytes[4]) << 8 | Int(bytes[5])
-        return type == 0x0006 && (len == 0x00D9 || len == 0x0039)
+        return type == 0x0004 && (len == 0x00D9 || len == 0x0039)
     }
 
     private func isRealtimePacket(_ bytes: [UInt8]) -> Bool {
@@ -950,33 +950,26 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
         print("[BLE] history page header=\(pageHeader.map { String(format: "%02x", $0) }.joined(separator: " ")) payloadLength=\(payload.count) bodyLength=\(body.count) recordSize=\(recordSize) recordCount=\(recordCount)")
         guard recordCount > 0 else { return }
 
-        var points: [DataPoint] = []
+        // Debug-only mode for history parsing: print candidate fields, do not store history values yet.
         for i in 0..<recordCount {
             let start = i * recordSize
             let rec = Array(body[start..<(start + recordSize)])
             let recHex = rec.map { String(format: "%02x", $0) }.joined(separator: " ")
 
-            // Based on observed type=0x0006 history body format:
-            // [0..1]=raw value, [2..3]=seq, [4..5]=duplicate raw value
-            let rawVal = Int(rec[0]) * 256 + Int(rec[1])
-            let seq = Int(rec[2]) * 256 + Int(rec[3])
-            let altRawVal = Int(rec[4]) * 256 + Int(rec[5])
-            let chosenRaw = rawVal > 0 ? rawVal : altRawVal
-            let value = Float(chosenRaw) / 100.0
+            let seq = Int(rec[0]) * 256 + Int(rec[1])
+            let candidate1 = Int(rec[2]) * 256 + Int(rec[3])
+            let candidate2 = Int(rec[4]) * 256 + Int(rec[5])
+            let candidate3 = Int(rec[10]) * 256 + Int(rec[11])
+            let candidate4 = Int(rec[14]) * 256 + Int(rec[15])
             let timestamp = computeTimestamp(deviceUUID: deviceUUID, deviceName: deviceName, receiveTime: Date(), seq: seq)
 
-            print("[BLE] history rec[\(i)] raw=\(recHex) parsed rawVal=\(rawVal) altRawVal=\(altRawVal) chosenRaw=\(chosenRaw) value=\(value) seq=\(seq) timestamp=\(timestamp)")
-            points.append(DataPoint(value: value, timestamp: timestamp, deviceName: deviceName, deviceUUID: deviceUUID, seq: seq))
+            print("[BLE] history rec[\(i)] raw=\(recHex) seq=\(seq) c1=\(candidate1) c2=\(candidate2) c3=\(candidate3) c4=\(candidate4) timestamp=\(timestamp)")
         }
 
         DispatchQueue.main.async {
             self.connectedPeripheralUUID = deviceUUID
             self.connectedPeripheralName = deviceName
-            self.status = "Receiving history data..."
-
-            for p in points {
-                self.upsert(p)
-            }
+            self.status = "Receiving history data (debug parse mode)..."
         }
     }
 
