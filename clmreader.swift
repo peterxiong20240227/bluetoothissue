@@ -950,7 +950,7 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
         print("[BLE] history page header=\(pageHeader.map { String(format: "%02x", $0) }.joined(separator: " ")) payloadLength=\(payload.count) bodyLength=\(body.count) recordSize=\(recordSize) recordCount=\(recordCount)")
         guard recordCount > 0 else { return }
 
-        // Debug-only mode for history parsing: print candidate fields, do not store history values yet.
+        var points: [DataPoint] = []
         for i in 0..<recordCount {
             let start = i * recordSize
             let rec = Array(body[start..<(start + recordSize)])
@@ -961,15 +961,21 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
             let candidate2 = Int(rec[4]) * 256 + Int(rec[5])
             let candidate3 = Int(rec[10]) * 256 + Int(rec[11])
             let candidate4 = Int(rec[14]) * 256 + Int(rec[15])
+            let value = Float(candidate4) / 100.0
             let timestamp = computeTimestamp(deviceUUID: deviceUUID, deviceName: deviceName, receiveTime: Date(), seq: seq)
 
-            print("[BLE] history rec[\(i)] raw=\(recHex) seq=\(seq) c1=\(candidate1) c2=\(candidate2) c3=\(candidate3) c4=\(candidate4) timestamp=\(timestamp)")
+            print("[BLE] history rec[\(i)] raw=\(recHex) seq=\(seq) c1=\(candidate1) c2=\(candidate2) c3=\(candidate3) c4=\(candidate4) chosen=\(candidate4) value=\(value) timestamp=\(timestamp)")
+            points.append(DataPoint(value: value, timestamp: timestamp, deviceName: deviceName, deviceUUID: deviceUUID, seq: seq))
         }
 
         DispatchQueue.main.async {
             self.connectedPeripheralUUID = deviceUUID
             self.connectedPeripheralName = deviceName
-            self.status = "Receiving history data (debug parse mode)..."
+            self.status = "Receiving history data..."
+
+            for p in points {
+                self.upsert(p)
+            }
         }
     }
 
