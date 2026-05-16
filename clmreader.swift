@@ -27,6 +27,8 @@ struct ClmReader: View {
     @State private var showManualSyncSheet = false
     @State private var manualSyncSeqInput = ""
     @State private var showClearHistoryAlert = false
+    @State private var showActivationTimeSheet = false
+    @State private var manualActivationTime = Date()
 
     @State private var endPinned = false
 
@@ -78,15 +80,29 @@ struct ClmReader: View {
                     }
                 }
 
-                Button {
-                    showChartTimePicker = true
-                } label: {
-                    Text("Select Chart Time Range")
-                        .font(.subheadline)
-                        .foregroundColor(.white)
-                        .padding(6)
-                        .background(Color.blue)
-                        .cornerRadius(8)
+                HStack(spacing: 10) {
+                    Button {
+                        manualActivationTime = ble.activationTimeForConnectedDevice() ?? Date()
+                        showActivationTimeSheet = true
+                    } label: {
+                        Text("Set Activation Time")
+                            .font(.subheadline)
+                            .foregroundColor(.white)
+                            .padding(6)
+                            .background(Color.teal)
+                            .cornerRadius(8)
+                    }
+
+                    Button {
+                        showChartTimePicker = true
+                    } label: {
+                        Text("Select Chart Time Range")
+                            .font(.subheadline)
+                            .foregroundColor(.white)
+                            .padding(6)
+                            .background(Color.blue)
+                            .cornerRadius(8)
+                    }
                 }
 
                 Button {
@@ -199,6 +215,35 @@ struct ClmReader: View {
                                 ble.manualSyncHistory(startSeq: nil)
                             }
                             showManualSyncSheet = false
+                        }
+                    }
+                }
+            }
+            .presentationDetents([.medium])
+        }
+        .sheet(isPresented: $showActivationTimeSheet) {
+            NavigationStack {
+                Form {
+                    Section("Activation Time") {
+                        DatePicker(
+                            "Activation Time",
+                            selection: $manualActivationTime,
+                            displayedComponents: [.date, .hourAndMinute]
+                        )
+                    }
+                }
+                .navigationTitle("Set Activation Time")
+                .toolbar {
+                    ToolbarItem(placement: .cancellationAction) {
+                        Button("Cancel") {
+                            showActivationTimeSheet = false
+                        }
+                    }
+                    ToolbarItem(placement: .confirmationAction) {
+                        Button("Save") {
+                            ble.setActivationTimeForConnectedDevice(manualActivationTime)
+                            rebuildDisplayData()
+                            showActivationTimeSheet = false
                         }
                     }
                 }
@@ -625,6 +670,20 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
         lastRequestedHistorySeq = nil
         lastReceivedHistorySeq = nil
         backfillRetryCount = 0
+    }
+
+    func activationTimeForConnectedDevice() -> Date? {
+        guard let deviceUUID = connectedPeripheralUUID else { return nil }
+        return activationTimes[deviceUUID]
+    }
+
+    func setActivationTimeForConnectedDevice(_ date: Date) {
+        guard let deviceUUID = connectedPeripheralUUID else { return }
+        activationTimes[deviceUUID] = date
+        if let deviceName = connectedPeripheralName {
+            recomputeTimestamps(for: deviceUUID, deviceName: deviceName)
+        }
+        status = "Activation time updated"
     }
 
     private func firstMissingSeq(in sortedSeqs: [Int]) -> Int? {
