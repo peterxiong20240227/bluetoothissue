@@ -544,6 +544,14 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
 
     private var didTriggerInitialSyncForCurrentConnection = false
 
+    private var isBackfillingHistory = false
+    private var backfillStartSeq: Int? = nil
+    private var backfillTargetSeq: Int? = nil
+    private var lastRequestedHistorySeq: Int? = nil
+    private var lastReceivedHistorySeq: Int? = nil
+    private var backfillRetryCount = 0
+    private let maxBackfillRetryCount = 3
+
     override init() {
         super.init()
         central = CBCentralManager(delegate: self, queue: .main)
@@ -578,6 +586,27 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
         }
 
         return (seqs.last ?? 0) + 1
+    }
+
+    private func firstMissingSeq(in sortedSeqs: [Int]) -> Int? {
+        guard !sortedSeqs.isEmpty else { return nil }
+
+        for idx in 1..<sortedSeqs.count {
+            let prev = sortedSeqs[idx - 1]
+            let current = sortedSeqs[idx]
+            if current > prev + 1 {
+                return prev + 1
+            }
+        }
+
+        return nil
+    }
+
+    private func latestKnownSeq(for deviceUUID: String) -> Int? {
+        historyData
+            .filter { $0.deviceUUID == deviceUUID }
+            .compactMap { $0.seq }
+            .max()
     }
 
     private func saveToLocal() {
@@ -652,10 +681,26 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
             return
         }
 
+        guard let deviceUUID = connectedPeripheralUUID else { return }
+
+        let beginSeq = startSeq
+            ?? nextMissingSeq(for: deviceUUID)
+            ?? ((latestKnownSeq(for: deviceUUID) ?? -1) + 1)
+
+        let targetSeq = latestKnownSeq(for: deviceUUID)
+
+        isBackfillingHistory = true
+        backfillStartSeq = beginSeq
+        backfillTargetSeq = targetSeq
+        lastRequestedHistorySeq = nil
+        lastReceivedHistorySeq = nil
+        backfillRetryCount = 0
+
         status = "Manual history sync..."
+
         sendSetTime()
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
-            self.sendHistoryRequest(startSeqOverride: startSeq)
+            self.requestHistoryPage(from: beginSeq)
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
             self.sendHistoryStreamStart()
@@ -688,6 +733,7 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
             notifyCharacteristic = nil
             writeCharacteristic = nil
             didTriggerInitialSyncForCurrentConnection = false
+            isBackfillingHistory = false
         }
         status = error == nil ? "Disconnected" : "Disconnected → Please reconnect"
     }
@@ -843,6 +889,8 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
             points.append(DataPoint(value: value, timestamp: timestamp, deviceName: deviceName, deviceUUID: deviceUUID, seq: seq))
         }
 
+        let pageMaxSeq = points.compactMap { $0.seq }.max()
+
         DispatchQueue.main.async {
             self.connectedPeripheralUUID = deviceUUID
             self.connectedPeripheralName = deviceName
@@ -850,6 +898,41 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
 
             for p in points {
                 self.upsert(p)
+            }
+
+            guard self.isBackfillingHistory else { return }
+
+            guard let pageMaxSeq else {
+                self.isBackfillingHistory = false
+                self.status = "History sync stopped"
+                return
+            }
+
+            if let lastRequested = self.lastRequestedHistorySeq, pageMaxSeq < lastRequested {
+                self.backfillRetryCount += 1
+                if self.backfillRetryCount > self.maxBackfillRetryCount {
+                    self.isBackfillingHistory = false
+                    self.status = "History sync stopped"
+                    return
+                }
+
+                self.requestHistoryPage(from: lastRequested)
+                return
+            }
+
+            self.backfillRetryCount = 0
+            self.lastReceivedHistorySeq = pageMaxSeq
+
+            if let target = self.backfillTargetSeq {
+                if pageMaxSeq < target {
+                    self.requestHistoryPage(from: pageMaxSeq + 1)
+                } else {
+                    self.isBackfillingHistory = false
+                    self.status = "History sync completed"
+                }
+            } else {
+                self.isBackfillingHistory = false
+                self.status = "History sync completed"
             }
         }
     }
@@ -868,12 +951,7 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
     }
 
     private func requestMissingHistoryIfNeeded(for deviceUUID: String) {
-        guard let latestRealtimeSeq = historyData
-            .filter({ $0.deviceUUID == deviceUUID })
-            .compactMap({ $0.seq })
-            .max() else {
-            return
-        }
+        guard !isBackfillingHistory else { return }
 
         let seqs = historyData
             .filter { $0.deviceUUID == deviceUUID }
@@ -884,21 +962,16 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
             return
         }
 
-        if latestRealtimeSeq > missing {
-            manualSyncHistory(startSeq: missing)
+        guard let latest = seqs.max(), latest > missing else {
+            return
         }
+
+        manualSyncHistory(startSeq: missing)
     }
 
-    private func firstMissingSeq(in sortedSeqs: [Int]) -> Int? {
-        guard !sortedSeqs.isEmpty else { return nil }
-        for idx in 1..<sortedSeqs.count {
-            let prev = sortedSeqs[idx - 1]
-            let current = sortedSeqs[idx]
-            if current > prev + 1 {
-                return prev + 1
-            }
-        }
-        return nil
+    private func requestHistoryPage(from startSeq: Int) {
+        lastRequestedHistorySeq = startSeq
+        sendHistoryRequest(startSeqOverride: startSeq)
     }
 
     // MARK: - History sync
@@ -913,16 +986,10 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
             return
         }
 
+        _ = writeCharacteristic
         didTriggerInitialSyncForCurrentConnection = true
         status = "Syncing device time and history..."
-
-        sendSetTime()
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
-            self.sendHistoryRequest(startSeqOverride: nil)
-        }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-            self.sendHistoryStreamStart()
-        }
+        manualSyncHistory(startSeq: nil)
     }
 
     private func sendSetTime() {
