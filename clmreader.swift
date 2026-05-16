@@ -587,9 +587,11 @@ struct DataPoint: Identifiable, Codable {
 final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CBPeripheralDelegate {
     static let shared = BLEManager()
 
-    private let storageKey = "LactateHistoryData"
     private let activationStorageKey = "DeviceActivationTimes"
     private let lastSeqStorageKey = "DeviceLastSeqs"
+    private let historyDirectoryName = "LactateHistory"
+    private let historyIndexStorageKey = "LactateHistoryDeviceUUIDs"
+    private let historyQueue = DispatchQueue(label: "de.copatec.LactateExpress.historyQueue", qos: .utility)
 
     private let targetServiceUUID = CBUUID(string: "8653000A-43E6-47B7-9CB0-5FC21D4AE340")
     private let notifyCharUUID = CBUUID(string: "8653000B-43E6-47B7-9CB0-5FC21D4AE340")
@@ -598,7 +600,7 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
     @Published var status = "Waiting Bluetooth"
     @Published var lactate = "0.00 mmol/L"
     @Published var rawData = "Waiting data..."
-    @Published var historyData: [DataPoint] = [] { didSet { saveToLocal() } }
+    @Published var historyData: [DataPoint] = []
     @Published var foundDevices: [CBPeripheral] = []
 
     @Published var connectedPeripheralUUID: String? = nil
@@ -617,6 +619,10 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
         didSet { saveLastSeqs() }
     }
 
+    private var deviceUUIDIndex: Set<String> = [] {
+        didSet { saveDeviceUUIDIndex() }
+    }
+
     private var didTriggerInitialSyncForCurrentConnection = false
 
     private var isBackfillingHistory = false
@@ -630,10 +636,10 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
     override init() {
         super.init()
         central = CBCentralManager(delegate: self, queue: .main)
-        loadFromLocal()
         loadActivationTimes()
         loadLastSeqs()
-        rebuildLastSeqsFromHistoryIfNeeded()
+        loadDeviceUUIDIndex()
+        loadHistoryFromFilesAsync()
     }
 
     func getAvailableDevices() -> [(uuid: String, name: String)] {
@@ -668,6 +674,8 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
         historyData.removeAll { $0.deviceUUID == deviceUUID }
         lastSeqs.removeValue(forKey: deviceUUID)
         activationTimes.removeValue(forKey: deviceUUID)
+        deviceUUIDIndex.remove(deviceUUID)
+        saveHistoryForDeviceAsync(deviceUUID)
         lactate = "0.00 mmol/L"
         rawData = "Waiting data..."
         status = "History cleared for current device"
@@ -690,6 +698,7 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
         if let deviceName = connectedPeripheralName {
             recomputeTimestamps(for: deviceUUID, deviceName: deviceName)
         }
+        saveHistoryForDeviceAsync(deviceUUID)
         status = "Activation time updated"
     }
 
@@ -714,18 +723,68 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
             .max()
     }
 
-    private func saveToLocal() {
-        if let data = try? JSONEncoder().encode(historyData) {
-            UserDefaults.standard.set(data, forKey: storageKey)
+    private func historyDirectoryURL() -> URL {
+        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+            ?? FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
+        let dir = base.appendingPathComponent(historyDirectoryName, isDirectory: true)
+        if !FileManager.default.fileExists(atPath: dir.path) {
+            try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        }
+        return dir
+    }
+
+    private func historyFileURL(for deviceUUID: String) -> URL {
+        let safeName = deviceUUID.replacingOccurrences(of: "/", with: "_")
+        return historyDirectoryURL().appendingPathComponent("\(safeName).json")
+    }
+
+    private func saveDeviceUUIDIndex() {
+        UserDefaults.standard.set(Array(deviceUUIDIndex).sorted(), forKey: historyIndexStorageKey)
+    }
+
+    private func loadDeviceUUIDIndex() {
+        let arr = UserDefaults.standard.stringArray(forKey: historyIndexStorageKey) ?? []
+        deviceUUIDIndex = Set(arr)
+    }
+
+    private func loadHistoryFromFilesAsync() {
+        historyQueue.async {
+            let uuids = Array(self.deviceUUIDIndex)
+            var loaded: [DataPoint] = []
+            for uuid in uuids {
+                let url = self.historyFileURL(for: uuid)
+                guard let data = try? Data(contentsOf: url),
+                      let arr = try? JSONDecoder().decode([DataPoint].self, from: data) else {
+                    continue
+                }
+                loaded.append(contentsOf: arr)
+            }
+            loaded.sort { $0.timestamp < $1.timestamp }
+            var rebuiltLastSeqs = self.lastSeqs
+            for item in loaded {
+                guard let seq = item.seq else { continue }
+                rebuiltLastSeqs[item.deviceUUID] = max(rebuiltLastSeqs[item.deviceUUID] ?? seq, seq)
+            }
+            DispatchQueue.main.async {
+                self.historyData = loaded
+                self.lastSeqs = rebuiltLastSeqs
+                self.status = self.status == "Waiting Bluetooth" ? "Bluetooth cache loaded" : self.status
+            }
         }
     }
 
-    private func loadFromLocal() {
-        guard let data = UserDefaults.standard.data(forKey: storageKey) else {
-            return
-        }
-        if let arr = try? JSONDecoder().decode([DataPoint].self, from: data) {
-            historyData = arr
+    private func saveHistoryForDeviceAsync(_ deviceUUID: String) {
+        let devicePoints = historyData
+            .filter { $0.deviceUUID == deviceUUID }
+            .sorted { $0.timestamp < $1.timestamp }
+        let url = historyFileURL(for: deviceUUID)
+        historyQueue.async {
+            if devicePoints.isEmpty {
+                try? FileManager.default.removeItem(at: url)
+                return
+            }
+            guard let data = try? JSONEncoder().encode(devicePoints) else { return }
+            try? data.write(to: url, options: [.atomic])
         }
     }
 
@@ -748,13 +807,6 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
     private func loadLastSeqs() {
         if let dict = UserDefaults.standard.dictionary(forKey: lastSeqStorageKey) as? [String: Int] {
             lastSeqs = dict
-        }
-    }
-
-    private func rebuildLastSeqsFromHistoryIfNeeded() {
-        for item in historyData {
-            guard let seq = item.seq else { continue }
-            lastSeqs[item.deviceUUID] = max(lastSeqs[item.deviceUUID] ?? seq, seq)
         }
     }
 
@@ -1043,15 +1095,19 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
     }
 
     private func upsert(_ point: DataPoint) {
+        let deviceUUID = point.deviceUUID
         if let seq = point.seq,
-           let idx = historyData.firstIndex(where: { $0.deviceUUID == point.deviceUUID && $0.seq == seq }) {
+           let idx = historyData.firstIndex(where: { $0.deviceUUID == deviceUUID && $0.seq == seq }) {
             historyData[idx] = point
         } else {
             historyData.append(point)
         }
 
+        deviceUUIDIndex.insert(deviceUUID)
+        saveHistoryForDeviceAsync(deviceUUID)
+
         if let seq = point.seq {
-            lastSeqs[point.deviceUUID] = max(lastSeqs[point.deviceUUID] ?? seq, seq)
+            lastSeqs[deviceUUID] = max(lastSeqs[deviceUUID] ?? seq, seq)
         }
     }
 
