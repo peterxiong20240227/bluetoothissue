@@ -330,7 +330,7 @@ struct LactateTableView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            HStack{
+            HStack {
                 Text("No.").bold()
                 Spacer()
                 Text("Device").bold()
@@ -428,12 +428,9 @@ enum DeviceSampleInterval {
 struct DataPoint: Identifiable, Codable {
     let id: UUID
     let value: Float
-    /// When activation time is known: timestamp = activationTime + seq * interval.
-    /// Before activation time is known: timestamp is receive-time.
     var timestamp: Date
     let deviceName: String
     let deviceUUID: String
-    /// Sequence number from device payload (e.g. 0x195f).
     let seq: Int?
 
     init(id: UUID = UUID(), value: Float, timestamp: Date, deviceName: String, deviceUUID: String, seq: Int?) {
@@ -445,23 +442,27 @@ struct DataPoint: Identifiable, Codable {
         self.seq = seq
     }
 
-    private static let _formatter: DateFormatter = {
+    private static let formatter: DateFormatter = {
         let f = DateFormatter()
         f.dateFormat = "MM-dd HH:mm"
         return f
     }()
 
-    var timeStr: String { Self._formatter.string(from: timestamp) }
+    var timeStr: String { Self.formatter.string(from: timestamp) }
 }
 
 // MARK: - BLE Manager
 
 final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CBPeripheralDelegate {
     static let shared = BLEManager()
-    private let storageKey = "LactateHistoryData"
 
-    /// Store per-device activation time + whether already inferred.
+    private let storageKey = "LactateHistoryData"
     private let activationStorageKey = "DeviceActivationTimes"
+    private let lastSeqStorageKey = "DeviceLastSeqs"
+
+    private let targetServiceUUID = CBUUID(string: "8653000A-43E6-47B7-9CB0-5FC21D4AE340")
+    private let notifyCharUUID = CBUUID(string: "8653000B-43E6-47B7-9CB0-5FC21D4AE340")
+    private let writeCharUUID = CBUUID(string: "8653000C-43E6-47B7-9CB0-5FC21D4AE340")
 
     @Published var status = "Waiting Bluetooth"
     @Published var lactate = "0.00 mmol/L"
@@ -475,17 +476,25 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
     private var central: CBCentralManager!
     private var notifyPeripheral: CBPeripheral?
     private var notifyCharacteristic: CBCharacteristic?
+    private var writeCharacteristic: CBCharacteristic?
 
-    /// Per-device inferred activation time.
     private var activationTimes: [String: Date] = [:] {
         didSet { saveActivationTimes() }
     }
+
+    private var lastSeqs: [String: Int] = [:] {
+        didSet { saveLastSeqs() }
+    }
+
+    private var didTriggerInitialSyncForCurrentConnection = false
 
     override init() {
         super.init()
         central = CBCentralManager(delegate: self, queue: .main)
         loadFromLocal()
         loadActivationTimes()
+        loadLastSeqs()
+        rebuildLastSeqsFromHistoryIfNeeded()
     }
 
     func getAvailableDevices() -> [(uuid: String, name: String)] {
@@ -510,7 +519,6 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
     }
 
     private func saveActivationTimes() {
-        // Persist as [deviceUUID: timeIntervalSince1970]
         let dict = activationTimes.mapValues { $0.timeIntervalSince1970 }
         UserDefaults.standard.set(dict, forKey: activationStorageKey)
     }
@@ -520,10 +528,27 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
         activationTimes = dict.mapValues { Date(timeIntervalSince1970: $0) }
     }
 
+    private func saveLastSeqs() {
+        UserDefaults.standard.set(lastSeqs, forKey: lastSeqStorageKey)
+    }
+
+    private func loadLastSeqs() {
+        if let dict = UserDefaults.standard.dictionary(forKey: lastSeqStorageKey) as? [String: Int] {
+            lastSeqs = dict
+        }
+    }
+
+    private func rebuildLastSeqsFromHistoryIfNeeded() {
+        for item in historyData {
+            guard let seq = item.seq else { continue }
+            lastSeqs[item.deviceUUID] = max(lastSeqs[item.deviceUUID] ?? seq, seq)
+        }
+    }
+
     func startScan() {
         foundDevices.removeAll()
         status = "Scanning..."
-        central.scanForPeripherals(withServices: nil, options: [CBCentralManagerScanOptionAllowDuplicatesKey: false])
+        central.scanForPeripherals(withServices: [targetServiceUUID], options: [CBCentralManagerScanOptionAllowDuplicatesKey: false])
     }
 
     func connect(_ peripheral: CBPeripheral) {
@@ -535,6 +560,9 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
 
         notifyPeripheral = peripheral
         notifyPeripheral?.delegate = self
+        notifyCharacteristic = nil
+        writeCharacteristic = nil
+        didTriggerInitialSyncForCurrentConnection = false
         central.connect(peripheral)
     }
 
@@ -553,7 +581,7 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
 
     func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
         status = "Connected: \(peripheral.name ?? "Device")"
-        peripheral.discoverServices(nil)
+        peripheral.discoverServices([targetServiceUUID])
     }
 
     func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?) {
@@ -562,6 +590,8 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
             connectedPeripheralName = nil
             notifyPeripheral = nil
             notifyCharacteristic = nil
+            writeCharacteristic = nil
+            didTriggerInitialSyncForCurrentConnection = false
         }
         status = error == nil ? "Disconnected" : "Disconnected → Please reconnect"
     }
@@ -572,8 +602,8 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
             return
         }
         guard let services = peripheral.services else { return }
-        for s in services {
-            peripheral.discoverCharacteristics(nil, for: s)
+        for s in services where s.uuid == targetServiceUUID {
+            peripheral.discoverCharacteristics([notifyCharUUID, writeCharUUID], for: s)
         }
     }
 
@@ -584,14 +614,19 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
         }
         guard let chars = service.characteristics else { return }
 
-        if notifyCharacteristic == nil {
-            if let c = chars.first(where: { $0.properties.contains(.notify) }) {
+        for c in chars {
+            if c.uuid == notifyCharUUID {
                 notifyCharacteristic = c
                 peripheral.setNotifyValue(true, for: c)
-                status = "Subscribing notify..."
-                print("Subscribe notify char: \(c.uuid.uuidString) on service: \(service.uuid.uuidString)")
+                print("Subscribe notify char: \(c.uuid.uuidString)")
+            }
+            if c.uuid == writeCharUUID {
+                writeCharacteristic = c
+                print("Found write char: \(c.uuid.uuidString)")
             }
         }
+
+        triggerInitialHistorySyncIfReady()
     }
 
     func peripheral(_ peripheral: CBPeripheral, didUpdateNotificationStateFor characteristic: CBCharacteristic, error: Error?) {
@@ -602,6 +637,7 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
         }
         status = characteristic.isNotifying ? "Notify ON" : "Notify OFF"
         print("Notify state for \(characteristic.uuid.uuidString) = \(characteristic.isNotifying)")
+        triggerInitialHistorySyncIfReady()
     }
 
     func peripheral(_ peripheral: CBPeripheral, didUpdateValueFor characteristic: CBCharacteristic, error: Error?) {
@@ -613,57 +649,210 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
         guard characteristic.uuid == notifyCharacteristic?.uuid else { return }
         guard let data = characteristic.value else { return }
 
-        var byteArray = [UInt8](repeating: 0, count: data.count)
-        data.copyBytes(to: &byteArray, count: byteArray.count)
+        let byteArray = [UInt8](data)
         rawData = byteArray.map { String(format: "%02x ", $0) }.joined()
-
-        // Existing code assumed value is [7],[8]. Keep it, but also parse seq if present.
-        guard byteArray.count >= 9 else { return }
-        let high = Int(byteArray[7])
-        let low = Int(byteArray[8])
-        let rawVal = high * 256 + low
-        let value = Float(rawVal) / 100.0
-
-        let seq = parseSeq(from: byteArray)
 
         let fullDeviceName = peripheral.name ?? "Unknown Device"
         let deviceUUID = peripheral.identifier.uuidString
 
-        DispatchQueue.main.async {
-            self.connectedPeripheralUUID = deviceUUID
-            self.connectedPeripheralName = fullDeviceName
-
-            self.lactate = String(format: "%.2f mmol/L", value)
-            self.status = "Receiving data..."
-
-            // Infer activation time on first realtime packet that has seq.
-            if self.activationTimes[deviceUUID] == nil, let seq {
-                let interval = self.deviceInterval(for: fullDeviceName)
-                let activation = Date().addingTimeInterval(-TimeInterval(seq) * interval.secondsPerSample)
-                self.activationTimes[deviceUUID] = activation
-                // Recompute timestamps for existing records for this device that have seq.
-                self.recomputeTimestamps(for: deviceUUID, deviceName: fullDeviceName)
-            }
-
-            let timestamp = self.computeTimestamp(deviceUUID: deviceUUID, deviceName: fullDeviceName, receiveTime: Date(), seq: seq)
-
-            let point = DataPoint(
-                value: value,
-                timestamp: timestamp,
-                deviceName: fullDeviceName,
-                deviceUUID: deviceUUID,
-                seq: seq
-            )
-            self.historyData.append(point)
+        if isHistoryPacket(byteArray) {
+            handleHistoryPacket(byteArray, deviceName: fullDeviceName, deviceUUID: deviceUUID)
+        } else {
+            handleRealtimePacket(byteArray, deviceName: fullDeviceName, deviceUUID: deviceUUID)
         }
     }
 
-    // MARK: - Timestamp / Seq helpers
+    // MARK: - Packet classification
+
+    private func isHistoryPacket(_ bytes: [UInt8]) -> Bool {
+        guard bytes.count >= 6 else { return false }
+        guard bytes[0] == 0xEB, bytes[1] == 0x90, bytes[2] == 0x00, bytes[3] == 0x04 else { return false }
+        let len = Int(bytes[4]) << 8 | Int(bytes[5])
+        return len == 0x00D9 || len == 0x0039
+    }
+
+    private func isRealtimePacket(_ bytes: [UInt8]) -> Bool {
+        guard bytes.count >= 6 else { return false }
+        guard bytes[0] == 0xEB, bytes[1] == 0x90, bytes[2] == 0x00, bytes[3] == 0x04 else { return false }
+        let len = Int(bytes[4]) << 8 | Int(bytes[5])
+        return len == 0x0019
+    }
+
+    // MARK: - Realtime / History handling
+
+    private func handleRealtimePacket(_ bytes: [UInt8], deviceName: String, deviceUUID: String) {
+        guard bytes.count >= 11 else { return }
+
+        // Keep current realtime value parse compatible with existing behavior.
+        guard bytes.count >= 9 else { return }
+        let rawVal = Int(bytes[7]) * 256 + Int(bytes[8])
+        let value = Float(rawVal) / 100.0
+        let seq = parseRealtimeSeq(from: bytes)
+
+        DispatchQueue.main.async {
+            self.connectedPeripheralUUID = deviceUUID
+            self.connectedPeripheralName = deviceName
+            self.lactate = String(format: "%.2f mmol/L", value)
+            self.status = "Receiving realtime data..."
+
+            if self.activationTimes[deviceUUID] == nil, let seq {
+                let interval = self.deviceInterval(for: deviceName)
+                let activation = Date().addingTimeInterval(-TimeInterval(seq) * interval.secondsPerSample)
+                self.activationTimes[deviceUUID] = activation
+                self.recomputeTimestamps(for: deviceUUID, deviceName: deviceName)
+            }
+
+            let timestamp = self.computeTimestamp(deviceUUID: deviceUUID, deviceName: deviceName, receiveTime: Date(), seq: seq)
+            let point = DataPoint(value: value, timestamp: timestamp, deviceName: deviceName, deviceUUID: deviceUUID, seq: seq)
+            self.upsert(point)
+        }
+    }
+
+    private func handleHistoryPacket(_ bytes: [UInt8], deviceName: String, deviceUUID: String) {
+        // Packet structure observed from previous discussion:
+        // header(6 bytes) + N * 16-byte records + checksum(2) + 0d0a(2)
+        guard bytes.count > 10 else { return }
+
+        let payload = Array(bytes.dropFirst(6).dropLast(4))
+        guard !payload.isEmpty else { return }
+
+        let recordSize = 16
+        let recordCount = payload.count / recordSize
+        guard recordCount > 0 else { return }
+
+        var points: [DataPoint] = []
+        for i in 0..<recordCount {
+            let start = i * recordSize
+            let rec = Array(payload[start..<(start + recordSize)])
+
+            // Based on prior packet analysis:
+            // rec[0..1] = value raw (big-endian), rec[2..3] = seq (big-endian)
+            let rawVal = Int(rec[0]) * 256 + Int(rec[1])
+            let value = Float(rawVal) / 100.0
+            let seq = Int(rec[2]) * 256 + Int(rec[3])
+            let timestamp = computeTimestamp(deviceUUID: deviceUUID, deviceName: deviceName, receiveTime: Date(), seq: seq)
+            points.append(DataPoint(value: value, timestamp: timestamp, deviceName: deviceName, deviceUUID: deviceUUID, seq: seq))
+        }
+
+        DispatchQueue.main.async {
+            self.connectedPeripheralUUID = deviceUUID
+            self.connectedPeripheralName = deviceName
+            self.status = "Receiving history data..."
+
+            for p in points {
+                self.upsert(p)
+            }
+        }
+    }
+
+    private func upsert(_ point: DataPoint) {
+        if let seq = point.seq,
+           let idx = historyData.firstIndex(where: { $0.deviceUUID == point.deviceUUID && $0.seq == seq }) {
+            historyData[idx] = point
+        } else {
+            historyData.append(point)
+        }
+
+        if let seq = point.seq {
+            lastSeqs[point.deviceUUID] = max(lastSeqs[point.deviceUUID] ?? seq, seq)
+        }
+    }
+
+    // MARK: - History sync
+
+    private func triggerInitialHistorySyncIfReady() {
+        guard !didTriggerInitialSyncForCurrentConnection else { return }
+        guard let peripheral = notifyPeripheral,
+              let notifyCharacteristic,
+              let writeCharacteristic,
+              notifyCharacteristic.isNotifying,
+              peripheral.state == .connected else {
+            return
+        }
+
+        didTriggerInitialSyncForCurrentConnection = true
+        status = "Syncing device time and history..."
+
+        sendSetTime()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+            self.sendHistoryRequest()
+        }
+    }
+
+    private func sendSetTime() {
+        guard let peripheral = notifyPeripheral, let writeCharacteristic else { return }
+        let packet = buildSetTimePacket(date: Date())
+        let data = Data(packet)
+        peripheral.writeValue(data, for: writeCharacteristic, type: .withoutResponse)
+        print("sendSetTime => \(packet.map { String(format: "%02x", $0) }.joined())")
+    }
+
+    private func sendHistoryRequest() {
+        guard let peripheral = notifyPeripheral,
+              let writeCharacteristic,
+              let deviceUUID = connectedPeripheralUUID else { return }
+
+        let startSeq: Int
+        if let last = lastSeqs[deviceUUID] {
+            startSeq = (last + 1) & 0xFFFF
+        } else {
+            startSeq = 0
+        }
+
+        let packet = buildHistoryRequestPacket(startSeq: startSeq)
+        let data = Data(packet)
+        peripheral.writeValue(data, for: writeCharacteristic, type: .withoutResponse)
+        print("sendHistoryRequest(startSeq=\(startSeq)) => \(packet.map { String(format: "%02x", $0) }.joined())")
+    }
+
+    private func buildSetTimePacket(date: Date) -> [UInt8] {
+        let cal = Calendar(identifier: .gregorian)
+        let year = cal.component(.year, from: date)
+        let month = cal.component(.month, from: date)
+        let day = cal.component(.day, from: date)
+        let hour = cal.component(.hour, from: date)
+        let minute = cal.component(.minute, from: date)
+        let second = cal.component(.second, from: date)
+
+        var payload: [UInt8] = [
+            0xEB, 0x90, 0x00, 0x03, 0x00, 0x13,
+            0x01, 0x00, 0x00, 0x00,
+            UInt8((year >> 8) & 0xFF), UInt8(year & 0xFF),
+            UInt8(month & 0xFF), UInt8(day & 0xFF),
+            UInt8(hour & 0xFF), UInt8(minute & 0xFF), UInt8(second & 0xFF),
+            0x00
+        ]
+
+        let sum = checksum16(payload)
+        payload.append(UInt8((sum >> 8) & 0xFF))
+        payload.append(UInt8(sum & 0xFF))
+        payload.append(0x0D)
+        payload.append(0x0A)
+        return payload
+    }
+
+    private func buildHistoryRequestPacket(startSeq: Int) -> [UInt8] {
+        var payload: [UInt8] = [
+            0xEB, 0x90, 0x00, 0x04, 0x00, 0x0D,
+            0x07, 0x00, 0x00,
+            UInt8((startSeq >> 8) & 0xFF), UInt8(startSeq & 0xFF)
+        ]
+
+        let sum = checksum16(payload)
+        payload.append(UInt8((sum >> 8) & 0xFF))
+        payload.append(UInt8(sum & 0xFF))
+        payload.append(0x0D)
+        payload.append(0x0A)
+        return payload
+    }
+
+    private func checksum16(_ bytes: [UInt8]) -> UInt16 {
+        bytes.reduce(0) { ($0 + UInt16($1)) & 0xFFFF }
+    }
+
+    // MARK: - Timestamp helpers
 
     private func deviceInterval(for deviceName: String) -> DeviceSampleInterval {
-        // Mapping provided by you:
-        // - Lactate device name contains "CLM" (1 min)
-        // - Glucose device name contains "CGM" (3 min)
         let upper = deviceName.uppercased()
         if upper.contains("CLM") {
             return .lactate1min
@@ -671,8 +860,6 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
         if upper.contains("CGM") {
             return .glucose3min
         }
-
-        // Fallback: keep previous heuristic if name doesn't include either.
         let lower = deviceName.lowercased()
         if lower.contains("lac") || lower.contains("lact") {
             return .lactate1min
@@ -699,19 +886,10 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
         }
     }
 
-    /// Parse seq16 from payload when present.
-    /// For packets like: eb9000040019090196195f0001...
-    /// This is currently a heuristic (seq at bytes[9..10]) based on samples you provided.
-    private func parseSeq(from bytes: [UInt8]) -> Int? {
+    private func parseRealtimeSeq(from bytes: [UInt8]) -> Int? {
+        guard isRealtimePacket(bytes) else { return nil }
         guard bytes.count >= 11 else { return nil }
-        guard bytes[0] == 0xEB, bytes[1] == 0x90 else { return nil }
-
-        // Candidate: bytes[9..10] (big-endian)
-        let candidate = Int(bytes[9]) * 256 + Int(bytes[10])
-        if candidate > 0 {
-            return candidate
-        }
-        return nil
+        return Int(bytes[9]) * 256 + Int(bytes[10])
     }
 }
 
