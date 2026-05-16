@@ -24,6 +24,8 @@ struct ClmReader: View {
     @State private var chartStartDate = Date().addingTimeInterval(-86400 * 7)
     @State private var chartEndDate = Date()
     @State private var showChartTimePicker = false
+    @State private var showManualSyncSheet = false
+    @State private var manualSyncSeqInput = ""
 
     @State private var endPinned = false
 
@@ -46,7 +48,13 @@ struct ClmReader: View {
 
             if ble.connectedPeripheralUUID != nil {
                 Button {
-                    ble.manualSyncHistory()
+                    if let currentUUID = ble.connectedPeripheralUUID {
+                        let suggested = ble.nextMissingSeq(for: currentUUID)
+                        manualSyncSeqInput = suggested.map(String.init) ?? ""
+                    } else {
+                        manualSyncSeqInput = ""
+                    }
+                    showManualSyncSheet = true
                 } label: {
                     Text("Sync History")
                         .font(.subheadline)
@@ -146,6 +154,43 @@ struct ClmReader: View {
             }
             .presentationDetents([.medium])
         }
+        .sheet(isPresented: $showManualSyncSheet) {
+            NavigationStack {
+                Form {
+                    Section("Start Seq") {
+                        TextField("Enter seq", text: $manualSyncSeqInput)
+                            .keyboardType(.numberPad)
+                    }
+
+                    if let currentUUID = ble.connectedPeripheralUUID,
+                       let suggested = ble.nextMissingSeq(for: currentUUID) {
+                        Section("Suggested") {
+                            Text("Suggested missing seq: \(suggested)")
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                }
+                .navigationTitle("Manual History Sync")
+                .toolbar {
+                    ToolbarItem(placement: .cancellationAction) {
+                        Button("Cancel") {
+                            showManualSyncSheet = false
+                        }
+                    }
+                    ToolbarItem(placement: .confirmationAction) {
+                        Button("Sync") {
+                            if let seq = Int(manualSyncSeqInput) {
+                                ble.manualSyncHistory(startSeq: seq)
+                            } else {
+                                ble.manualSyncHistory(startSeq: nil)
+                            }
+                            showManualSyncSheet = false
+                        }
+                    }
+                }
+            }
+            .presentationDetents([.medium])
+        }
         .onChange(of: showExportSheet) { val in
             if !val && shouldExportAfterDismiss {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.7) {
@@ -186,6 +231,7 @@ struct ClmReader: View {
                 return true
             }
         }
+        .sorted { $0.timestamp < $1.timestamp }
     }
 
     private func exportAndShareDirectly() {
@@ -515,6 +561,25 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
         }
     }
 
+    func nextMissingSeq(for deviceUUID: String) -> Int? {
+        let seqs = historyData
+            .filter { $0.deviceUUID == deviceUUID }
+            .compactMap { $0.seq }
+            .sorted()
+
+        guard !seqs.isEmpty else { return nil }
+
+        for idx in 1..<seqs.count {
+            let prev = seqs[idx - 1]
+            let current = seqs[idx]
+            if current > prev + 1 {
+                return prev + 1
+            }
+        }
+
+        return (seqs.last ?? 0) + 1
+    }
+
     private func saveToLocal() {
         if let data = try? JSONEncoder().encode(historyData) {
             UserDefaults.standard.set(data, forKey: storageKey)
@@ -581,7 +646,7 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
         central.connect(peripheral)
     }
 
-    func manualSyncHistory() {
+    func manualSyncHistory(startSeq: Int? = nil) {
         guard notifyPeripheral != nil, writeCharacteristic != nil else {
             status = "Sync failed: write channel not ready"
             return
@@ -590,7 +655,7 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
         status = "Manual history sync..."
         sendSetTime()
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
-            self.sendHistoryRequest(startSeqOverride: nil)
+            self.sendHistoryRequest(startSeqOverride: startSeq)
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
             self.sendHistoryStreamStart()
@@ -678,7 +743,7 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
     }
 
     func peripheral(_ peripheral: CBPeripheral, didUpdateValueFor characteristic: CBCharacteristic, error: Error?) {
-        if let error {
+        if error != nil {
             return
         }
 
@@ -746,6 +811,7 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
             let timestamp = self.computeTimestamp(deviceUUID: deviceUUID, deviceName: deviceName, receiveTime: Date(), seq: seq)
             let point = DataPoint(value: value, timestamp: timestamp, deviceName: deviceName, deviceUUID: deviceUUID, seq: seq)
             self.upsert(point)
+            self.requestMissingHistoryIfNeeded(for: deviceUUID)
         }
     }
 
@@ -799,6 +865,40 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
         if let seq = point.seq {
             lastSeqs[point.deviceUUID] = max(lastSeqs[point.deviceUUID] ?? seq, seq)
         }
+    }
+
+    private func requestMissingHistoryIfNeeded(for deviceUUID: String) {
+        guard let latestRealtimeSeq = historyData
+            .filter({ $0.deviceUUID == deviceUUID })
+            .compactMap({ $0.seq })
+            .max() else {
+            return
+        }
+
+        let seqs = historyData
+            .filter { $0.deviceUUID == deviceUUID }
+            .compactMap { $0.seq }
+            .sorted()
+
+        guard let missing = firstMissingSeq(in: seqs) else {
+            return
+        }
+
+        if latestRealtimeSeq > missing {
+            manualSyncHistory(startSeq: missing)
+        }
+    }
+
+    private func firstMissingSeq(in sortedSeqs: [Int]) -> Int? {
+        guard !sortedSeqs.isEmpty else { return nil }
+        for idx in 1..<sortedSeqs.count {
+            let prev = sortedSeqs[idx - 1]
+            let current = sortedSeqs[idx]
+            if current > prev + 1 {
+                return prev + 1
+            }
+        }
+        return nil
     }
 
     // MARK: - History sync
@@ -920,14 +1020,6 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
 
     private func checksum16(_ bytes: [UInt8]) -> UInt16 {
         bytes.reduce(0) { ($0 + UInt16($1)) & 0xFFFF }
-    }
-
-    private func validateChecksum(_ bytes: [UInt8]) -> Bool {
-        guard bytes.count >= 4 else { return false }
-        let payload = Array(bytes.dropLast(4))
-        let expected = Int(bytes[bytes.count - 4]) * 256 + Int(bytes[bytes.count - 3])
-        let actual = Int(checksum16(payload))
-        return expected == actual
     }
 
     // MARK: - Timestamp helpers
