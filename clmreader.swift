@@ -532,7 +532,6 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
     @Published var connectedPeripheralUUID: String? = nil
     @Published var connectedPeripheralName: String? = nil
 
-    // UI debug helper (raw send)
     @Published var showRawSendPanel: Bool = false
     @Published var rawHexToSend: String = ""
 
@@ -571,7 +570,6 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
     }
 
     func fillRawHexHistoryStart0() {
-        // Fill current known history request format using startSeq=0
         let pkt = buildHistoryRequestPacket(startSeq: 0)
         rawHexToSend = pkt.map { String(format: "%02x", $0) }.joined(separator: " ")
         print("[BLE] fillRawHexHistoryStart0 => \(rawHexToSend)")
@@ -717,6 +715,9 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
             self.sendHistoryRequest(startSeqOverride: nil)
         }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+            self.sendHistoryStreamStart()
+        }
     }
 
     func centralManagerDidUpdateState(_ central: CBCentralManager) {
@@ -861,9 +862,10 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
 
     private func isHistoryPacket(_ bytes: [UInt8]) -> Bool {
         guard bytes.count >= 6 else { return false }
-        guard bytes[0] == 0xEB, bytes[1] == 0x90, bytes[2] == 0x00, bytes[3] == 0x04 else { return false }
+        guard bytes[0] == 0xEB, bytes[1] == 0x90 else { return false }
+        let type = Int(bytes[2]) << 8 | Int(bytes[3])
         let len = Int(bytes[4]) << 8 | Int(bytes[5])
-        return len == 0x00D9 || len == 0x0039
+        return type == 0x0006 && (len == 0x00D9 || len == 0x0039)
     }
 
     private func isRealtimePacket(_ bytes: [UInt8]) -> Bool {
@@ -874,7 +876,6 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
     }
 
     private func parseAckOrStatusPacket(_ bytes: [UInt8]) {
-        // Common ACK/STATUS frames observed: len = 0x000C
         guard bytes.count >= 6 else { return }
         let packetType = Int(bytes[2]) << 8 | Int(bytes[3])
         let len = Int(bytes[4]) << 8 | Int(bytes[5])
@@ -889,7 +890,6 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
 
         print("[BLE] ACK/STATUS packet: type=0x\(String(format: "%04X", packetType)) len=0x\(String(format: "%04X", len)) payload=\(payloadHex) checksum=\(expected.map { String(format: "0x%04X", $0) } ?? "nil")")
 
-        // Heuristic: show first few payload bytes as potential command/status.
         if payload.count >= 2 {
             let cmd = Int(payload[0])
             let sub = Int(payload[1])
@@ -931,34 +931,41 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
     }
 
     private func handleHistoryPacket(_ bytes: [UInt8], deviceName: String, deviceUUID: String) {
-        guard bytes.count > 10 else {
+        guard bytes.count > 13 else {
             print("[BLE] handleHistoryPacket ignored, too short count=\(bytes.count)")
             return
         }
 
         let payload = Array(bytes.dropFirst(6).dropLast(4))
-        guard !payload.isEmpty else {
+        guard payload.count > 3 else {
             print("[BLE] handleHistoryPacket empty payload after trimming")
             return
         }
 
+        let pageHeader = Array(payload.prefix(3))
+        let body = Array(payload.dropFirst(3))
         let recordSize = 16
-        let recordCount = payload.count / recordSize
-        print("[BLE] history payload length=\(payload.count), recordSize=\(recordSize), recordCount=\(recordCount)")
+        let recordCount = body.count / recordSize
+
+        print("[BLE] history page header=\(pageHeader.map { String(format: "%02x", $0) }.joined(separator: " ")) payloadLength=\(payload.count) bodyLength=\(body.count) recordSize=\(recordSize) recordCount=\(recordCount)")
         guard recordCount > 0 else { return }
 
         var points: [DataPoint] = []
         for i in 0..<recordCount {
             let start = i * recordSize
-            let rec = Array(payload[start..<(start + recordSize)])
+            let rec = Array(body[start..<(start + recordSize)])
             let recHex = rec.map { String(format: "%02x", $0) }.joined(separator: " ")
 
+            // Based on observed type=0x0006 history body format:
+            // [0..1]=raw value, [2..3]=seq, [4..5]=duplicate raw value
             let rawVal = Int(rec[0]) * 256 + Int(rec[1])
-            let value = Float(rawVal) / 100.0
             let seq = Int(rec[2]) * 256 + Int(rec[3])
+            let altRawVal = Int(rec[4]) * 256 + Int(rec[5])
+            let chosenRaw = rawVal > 0 ? rawVal : altRawVal
+            let value = Float(chosenRaw) / 100.0
             let timestamp = computeTimestamp(deviceUUID: deviceUUID, deviceName: deviceName, receiveTime: Date(), seq: seq)
 
-            print("[BLE] history rec[\(i)] raw=\(recHex) parsed value=\(value) seq=\(seq) timestamp=\(timestamp)")
+            print("[BLE] history rec[\(i)] raw=\(recHex) parsed rawVal=\(rawVal) altRawVal=\(altRawVal) chosenRaw=\(chosenRaw) value=\(value) seq=\(seq) timestamp=\(timestamp)")
             points.append(DataPoint(value: value, timestamp: timestamp, deviceName: deviceName, deviceUUID: deviceUUID, seq: seq))
         }
 
@@ -1011,6 +1018,9 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
             self.sendHistoryRequest(startSeqOverride: nil)
         }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+            self.sendHistoryStreamStart()
+        }
     }
 
     private func sendSetTime() {
@@ -1047,6 +1057,17 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
         peripheral.writeValue(data, for: writeCharacteristic, type: .withResponse)
     }
 
+    private func sendHistoryStreamStart() {
+        guard let peripheral = notifyPeripheral, let writeCharacteristic else {
+            print("[BLE] sendHistoryStreamStart aborted: missing peripheral or writeCharacteristic")
+            return
+        }
+
+        let packet = buildHistoryStreamStartPacket()
+        print("[BLE] sendHistoryStreamStart => \(packet.map { String(format: "%02x", $0) }.joined(separator: " "))")
+        peripheral.writeValue(Data(packet), for: writeCharacteristic, type: .withResponse)
+    }
+
     private func buildSetTimePacket(date: Date) -> [UInt8] {
         let cal = Calendar(identifier: .gregorian)
         let year = cal.component(.year, from: date)
@@ -1080,6 +1101,19 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
             UInt8((startSeq >> 8) & 0xFF), UInt8(startSeq & 0xFF)
         ]
 
+        let sum = checksum16(payload)
+        payload.append(UInt8((sum >> 8) & 0xFF))
+        payload.append(UInt8(sum & 0xFF))
+        payload.append(0x0D)
+        payload.append(0x0A)
+        return payload
+    }
+
+    private func buildHistoryStreamStartPacket() -> [UInt8] {
+        var payload: [UInt8] = [
+            0xEB, 0x90, 0x00, 0x06, 0x00, 0x0D,
+            0x07, 0x00, 0x00, 0x00, 0x01
+        ]
         let sum = checksum16(payload)
         payload.append(UInt8((sum >> 8) & 0xFF))
         payload.append(UInt8(sum & 0xFF))
