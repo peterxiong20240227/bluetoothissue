@@ -45,15 +45,63 @@ struct ClmReader: View {
                 .foregroundColor(.green)
 
             if ble.connectedPeripheralUUID != nil {
-                Button {
-                    ble.manualSyncHistory()
-                } label: {
-                    Text("Sync History")
-                        .font(.subheadline)
-                        .foregroundColor(.white)
-                        .padding(6)
-                        .background(Color.purple)
-                        .cornerRadius(8)
+                HStack(spacing: 10) {
+                    Button {
+                        ble.manualSyncHistory()
+                    } label: {
+                        Text("Sync History")
+                            .font(.subheadline)
+                            .foregroundColor(.white)
+                            .padding(6)
+                            .background(Color.purple)
+                            .cornerRadius(8)
+                    }
+
+                    Button {
+                        ble.toggleRawSendPanel()
+                    } label: {
+                        Text("Send Raw")
+                            .font(.subheadline)
+                            .foregroundColor(.white)
+                            .padding(6)
+                            .background(Color.gray)
+                            .cornerRadius(8)
+                    }
+                }
+
+                if ble.showRawSendPanel {
+                    VStack(spacing: 8) {
+                        Text("Raw Hex (spaces ok, no 0x prefix)")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+
+                        TextField("e.g. eb 90 00 04 ... 0d 0a", text: $ble.rawHexToSend)
+                            .textInputAutocapitalization(.never)
+                            .disableAutocorrection(true)
+                            .textFieldStyle(.roundedBorder)
+                            .font(.system(size: 12, design: .monospaced))
+
+                        HStack(spacing: 10) {
+                            Button("Send") {
+                                ble.sendRawHexFromUI()
+                            }
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 6)
+                            .background(Color.black)
+                            .foregroundColor(.white)
+                            .cornerRadius(8)
+
+                            Button("Fill: History startSeq=0") {
+                                ble.fillRawHexHistoryStart0()
+                            }
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 6)
+                            .background(Color.blue)
+                            .foregroundColor(.white)
+                            .cornerRadius(8)
+                        }
+                    }
+                    .padding(.horizontal)
                 }
 
                 Button {
@@ -484,6 +532,10 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
     @Published var connectedPeripheralUUID: String? = nil
     @Published var connectedPeripheralName: String? = nil
 
+    // UI debug helper (raw send)
+    @Published var showRawSendPanel: Bool = false
+    @Published var rawHexToSend: String = ""
+
     private var central: CBCentralManager!
     private var notifyPeripheral: CBPeripheral?
     private var notifyCharacteristic: CBCharacteristic?
@@ -507,6 +559,60 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
         loadLastSeqs()
         rebuildLastSeqsFromHistoryIfNeeded()
         print("[BLE] Manager initialized. history count=\(historyData.count), activationTimes=\(activationTimes.count), lastSeqs=\(lastSeqs.count)")
+    }
+
+    func toggleRawSendPanel() {
+        showRawSendPanel.toggle()
+        print("[BLE] toggleRawSendPanel => \(showRawSendPanel)")
+    }
+
+    func sendRawHexFromUI() {
+        sendRawHex(rawHexToSend)
+    }
+
+    func fillRawHexHistoryStart0() {
+        // Fill current known history request format using startSeq=0
+        let pkt = buildHistoryRequestPacket(startSeq: 0)
+        rawHexToSend = pkt.map { String(format: "%02x", $0) }.joined(separator: " ")
+        print("[BLE] fillRawHexHistoryStart0 => \(rawHexToSend)")
+    }
+
+    func sendRawHex(_ hex: String) {
+        guard let peripheral = notifyPeripheral, let writeCharacteristic else {
+            print("[BLE] sendRawHex aborted: missing peripheral or writeCharacteristic")
+            status = "Raw send failed: write not ready"
+            return
+        }
+
+        let cleaned = hex
+            .replacingOccurrences(of: "0x", with: "")
+            .replacingOccurrences(of: " ", with: "")
+            .replacingOccurrences(of: "\n", with: "")
+            .replacingOccurrences(of: "\t", with: "")
+
+        guard cleaned.count % 2 == 0, !cleaned.isEmpty else {
+            print("[BLE] sendRawHex invalid hex length")
+            status = "Raw send failed: invalid hex"
+            return
+        }
+
+        var bytes: [UInt8] = []
+        bytes.reserveCapacity(cleaned.count / 2)
+        var idx = cleaned.startIndex
+        while idx < cleaned.endIndex {
+            let next = cleaned.index(idx, offsetBy: 2)
+            let byteStr = String(cleaned[idx..<next])
+            guard let b = UInt8(byteStr, radix: 16) else {
+                print("[BLE] sendRawHex invalid byte: \(byteStr)")
+                status = "Raw send failed: invalid byte"
+                return
+            }
+            bytes.append(b)
+            idx = next
+        }
+
+        print("[BLE] sendRawHex => \(bytes.map { String(format: "%02x", $0) }.joined(separator: " "))")
+        peripheral.writeValue(Data(bytes), for: writeCharacteristic, type: .withResponse)
     }
 
     func getAvailableDevices() -> [(uuid: String, name: String)] {
@@ -609,7 +715,7 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
         status = "Manual history sync..."
         sendSetTime()
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
-            self.sendHistoryRequest()
+            self.sendHistoryRequest(startSeqOverride: nil)
         }
     }
 
@@ -731,7 +837,9 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
 
         let byteArray = [UInt8](data)
         rawData = byteArray.map { String(format: "%02x ", $0) }.joined()
-        print("[BLE] notify <= \(byteArray.map { String(format: "%02x", $0) }.joined(separator: " "))")
+
+        let hex = byteArray.map { String(format: "%02x", $0) }.joined(separator: " ")
+        print("[BLE] notify <= \(hex)")
         print("[BLE] notify checksum valid => \(validateChecksum(byteArray))")
 
         let fullDeviceName = peripheral.name ?? "Unknown Device"
@@ -740,9 +848,12 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
         if isHistoryPacket(byteArray) {
             print("[BLE] packet classified as HISTORY")
             handleHistoryPacket(byteArray, deviceName: fullDeviceName, deviceUUID: deviceUUID)
-        } else {
-            print("[BLE] packet classified as REALTIME/OTHER")
+        } else if isRealtimePacket(byteArray) {
+            print("[BLE] packet classified as REALTIME")
             handleRealtimePacket(byteArray, deviceName: fullDeviceName, deviceUUID: deviceUUID)
+        } else {
+            print("[BLE] packet classified as ACK/STATUS")
+            parseAckOrStatusPacket(byteArray)
         }
     }
 
@@ -760,6 +871,30 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
         guard bytes[0] == 0xEB, bytes[1] == 0x90, bytes[2] == 0x00, bytes[3] == 0x04 else { return false }
         let len = Int(bytes[4]) << 8 | Int(bytes[5])
         return len == 0x0019
+    }
+
+    private func parseAckOrStatusPacket(_ bytes: [UInt8]) {
+        // Common ACK/STATUS frames observed: len = 0x000C
+        guard bytes.count >= 6 else { return }
+        let packetType = Int(bytes[2]) << 8 | Int(bytes[3])
+        let len = Int(bytes[4]) << 8 | Int(bytes[5])
+
+        var expected: Int? = nil
+        if bytes.count >= 4 {
+            expected = Int(bytes[bytes.count - 4]) * 256 + Int(bytes[bytes.count - 3])
+        }
+
+        let payload = Array(bytes.dropFirst(6).dropLast(4))
+        let payloadHex = payload.map { String(format: "%02x", $0) }.joined(separator: " ")
+
+        print("[BLE] ACK/STATUS packet: type=0x\(String(format: "%04X", packetType)) len=0x\(String(format: "%04X", len)) payload=\(payloadHex) checksum=\(expected.map { String(format: "0x%04X", $0) } ?? "nil")")
+
+        // Heuristic: show first few payload bytes as potential command/status.
+        if payload.count >= 2 {
+            let cmd = Int(payload[0])
+            let sub = Int(payload[1])
+            print("[BLE] ACK/STATUS decode guess: cmd=0x\(String(format: "%02X", cmd)) sub=0x\(String(format: "%02X", sub))")
+        }
     }
 
     // MARK: - Realtime / History handling
@@ -874,7 +1009,7 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
 
         sendSetTime()
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
-            self.sendHistoryRequest()
+            self.sendHistoryRequest(startSeqOverride: nil)
         }
     }
 
@@ -889,7 +1024,7 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
         peripheral.writeValue(data, for: writeCharacteristic, type: .withResponse)
     }
 
-    private func sendHistoryRequest() {
+    private func sendHistoryRequest(startSeqOverride: Int?) {
         guard let peripheral = notifyPeripheral,
               let writeCharacteristic,
               let deviceUUID = connectedPeripheralUUID else {
@@ -898,7 +1033,9 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
         }
 
         let startSeq: Int
-        if let last = lastSeqs[deviceUUID] {
+        if let startSeqOverride {
+            startSeq = startSeqOverride & 0xFFFF
+        } else if let last = lastSeqs[deviceUUID] {
             startSeq = (last + 1) & 0xFFFF
         } else {
             startSeq = 0
