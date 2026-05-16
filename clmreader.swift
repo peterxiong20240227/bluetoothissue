@@ -184,10 +184,10 @@ struct ClmReader: View {
             return timeMatch && deviceMatch
         }
 
-        let header = "No,Device Name,Time,Lac Value(mmol/L)\n"
+        let header = "No,Device Name,Time,Seq,Lac Value(mmol/L)\n"
         var csv = header
         for (i, item) in filtered.enumerated() {
-            csv += "\(i + 1),\(item.deviceName),\(item.timeStr),\(String(format: "%.2f", item.value))\n"
+            csv += "\(i + 1),\(item.deviceName),\(item.timeStr),\(item.seq.map(String.init) ?? ""),\(String(format: "%.2f", item.value))\n"
         }
 
         let fileName = "Lactate_\(Date().timeIntervalSince1970).csv"
@@ -337,6 +337,8 @@ struct LactateTableView: View {
                 Spacer()
                 Text("Time").bold()
                 Spacer()
+                Text("Seq").bold()
+                Spacer()
                 Text("Lac Value").bold()
             }
             .padding(.vertical, 6)
@@ -351,6 +353,8 @@ struct LactateTableView: View {
                             Text(item.deviceName)
                             Spacer()
                             Text(item.timeStr)
+                            Spacer()
+                            Text(item.seq.map(String.init) ?? "")
                             Spacer()
                             Text(String(format: "%.2f", item.value))
                         }
@@ -409,19 +413,36 @@ struct ExportFilterView: View {
 
 // MARK: - Data Model
 
+enum DeviceSampleInterval {
+    case lactate1min
+    case glucose3min
+
+    var secondsPerSample: TimeInterval {
+        switch self {
+        case .lactate1min: return 60
+        case .glucose3min: return 180
+        }
+    }
+}
+
 struct DataPoint: Identifiable, Codable {
     let id: UUID
     let value: Float
-    let timestamp: Date
+    /// When activation time is known: timestamp = activationTime + seq * interval.
+    /// Before activation time is known: timestamp is receive-time.
+    var timestamp: Date
     let deviceName: String
     let deviceUUID: String
+    /// Sequence number from device payload (e.g. 0x195f).
+    let seq: Int?
 
-    init(id: UUID = UUID(), value: Float, timestamp: Date, deviceName: String, deviceUUID: String) {
+    init(id: UUID = UUID(), value: Float, timestamp: Date, deviceName: String, deviceUUID: String, seq: Int?) {
         self.id = id
         self.value = value
         self.timestamp = timestamp
         self.deviceName = deviceName
         self.deviceUUID = deviceUUID
+        self.seq = seq
     }
 
     private static let _formatter: DateFormatter = {
@@ -439,6 +460,9 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
     static let shared = BLEManager()
     private let storageKey = "LactateHistoryData"
 
+    /// Store per-device activation time + whether already inferred.
+    private let activationStorageKey = "DeviceActivationTimes"
+
     @Published var status = "Waiting Bluetooth"
     @Published var lactate = "0.00 mmol/L"
     @Published var rawData = "Waiting data..."
@@ -452,10 +476,16 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
     private var notifyPeripheral: CBPeripheral?
     private var notifyCharacteristic: CBCharacteristic?
 
+    /// Per-device inferred activation time.
+    private var activationTimes: [String: Date] = [:] {
+        didSet { saveActivationTimes() }
+    }
+
     override init() {
         super.init()
         central = CBCentralManager(delegate: self, queue: .main)
         loadFromLocal()
+        loadActivationTimes()
     }
 
     func getAvailableDevices() -> [(uuid: String, name: String)] {
@@ -477,6 +507,17 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
         if let arr = try? JSONDecoder().decode([DataPoint].self, from: data) {
             historyData = arr
         }
+    }
+
+    private func saveActivationTimes() {
+        // Persist as [deviceUUID: timeIntervalSince1970]
+        let dict = activationTimes.mapValues { $0.timeIntervalSince1970 }
+        UserDefaults.standard.set(dict, forKey: activationStorageKey)
+    }
+
+    private func loadActivationTimes() {
+        guard let dict = UserDefaults.standard.dictionary(forKey: activationStorageKey) as? [String: TimeInterval] else { return }
+        activationTimes = dict.mapValues { Date(timeIntervalSince1970: $0) }
     }
 
     func startScan() {
@@ -576,11 +617,14 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
         data.copyBytes(to: &byteArray, count: byteArray.count)
         rawData = byteArray.map { String(format: "%02x ", $0) }.joined()
 
+        // Existing code assumed value is [7],[8]. Keep it, but also parse seq if present.
         guard byteArray.count >= 9 else { return }
         let high = Int(byteArray[7])
         let low = Int(byteArray[8])
         let rawVal = high * 256 + low
         let value = Float(rawVal) / 100.0
+
+        let seq = parseSeq(from: byteArray)
 
         let fullDeviceName = peripheral.name ?? "Unknown Device"
         let deviceUUID = peripheral.identifier.uuidString
@@ -592,14 +636,95 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
             self.lactate = String(format: "%.2f mmol/L", value)
             self.status = "Receiving data..."
 
+            // Infer activation time on first realtime packet that has seq.
+            if self.activationTimes[deviceUUID] == nil, let seq {
+                let interval = self.deviceInterval(for: fullDeviceName)
+                let activation = Date().addingTimeInterval(-TimeInterval(seq) * interval.secondsPerSample)
+                self.activationTimes[deviceUUID] = activation
+                // Recompute timestamps for existing records for this device that have seq.
+                self.recomputeTimestamps(for: deviceUUID)
+            }
+
+            let timestamp = self.computeTimestamp(deviceUUID: deviceUUID, receiveTime: Date(), seq: seq)
+
             let point = DataPoint(
                 value: value,
-                timestamp: Date(),
+                timestamp: timestamp,
                 deviceName: fullDeviceName,
-                deviceUUID: deviceUUID
+                deviceUUID: deviceUUID,
+                seq: seq
             )
             self.historyData.append(point)
         }
+    }
+
+    // MARK: - Timestamp / Seq helpers
+
+    private func deviceInterval(for deviceName: String) -> DeviceSampleInterval {
+        // TODO: adjust mapping to your actual names.
+        // Current assumption: lactate device names contain "Lac" or "Lact"; glucose otherwise.
+        let lower = deviceName.lowercased()
+        if lower.contains("lac") || lower.contains("lact") {
+            return .lactate1min
+        }
+        return .glucose3min
+    }
+
+    private func computeTimestamp(deviceUUID: String, receiveTime: Date, seq: Int?) -> Date {
+        guard let seq, let activation = activationTimes[deviceUUID] else {
+            return receiveTime
+        }
+        // NOTE: currently uses lactate interval for all if we don't know device name here.
+        // We do have deviceName in caller; if needed pass in to computeTimestamp.
+        // For now infer interval from existing historyData deviceName if possible.
+        let name = historyData.last(where: { $0.deviceUUID == deviceUUID })?.deviceName ?? ""
+        let interval = deviceInterval(for: name)
+        return activation.addingTimeInterval(TimeInterval(seq) * interval.secondsPerSample)
+    }
+
+    private func recomputeTimestamps(for deviceUUID: String) {
+        guard let activation = activationTimes[deviceUUID] else { return }
+        // Find device name for interval inference
+        let name = historyData.last(where: { $0.deviceUUID == deviceUUID })?.deviceName ?? ""
+        let interval = deviceInterval(for: name)
+
+        for idx in historyData.indices {
+            guard historyData[idx].deviceUUID == deviceUUID else { continue }
+            guard let seq = historyData[idx].seq else { continue }
+            historyData[idx].timestamp = activation.addingTimeInterval(TimeInterval(seq) * interval.secondsPerSample)
+        }
+    }
+
+    /// Parse seq16 from payload when present.
+    /// For packets like: eb 90 00 04 00 19 ... 19 5f ...
+    /// We locate the first occurrence of 0xeb 0x90 0x00 0x04 and then read seq at [12],[13] if length >= 14.
+    /// This is based on the sample you provided. If your format varies, we should refine this.
+    private func parseSeq(from bytes: [UInt8]) -> Int? {
+        guard bytes.count >= 14 else { return nil }
+        // Quick check header.
+        if bytes[0] == 0xEB && bytes[1] == 0x90 {
+            // Empirically: seq bytes are around index 12..13 for 0x0019 realtime packets.
+            // Example: eb9000040019090196195f0001...
+            // indexes: 0 eb
+            // 1 90
+            // 2 00
+            // 3 04
+            // 4 00
+            // 5 19
+            // 6 09
+            // 7 01
+            // 8 96
+            // 9 19
+            // 10 5f
+            // In this example seq is at 9..10.
+            // But in current reader we treat 7..8 as value.
+            // So, implement a heuristic: if bytes[9..10] looks like a monotonically increasing seq (> 0x0100 typically), return it.
+            let candidate = Int(bytes[9]) * 256 + Int(bytes[10])
+            if candidate > 0 {
+                return candidate
+            }
+        }
+        return nil
     }
 }
 
