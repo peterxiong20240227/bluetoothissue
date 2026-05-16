@@ -591,6 +591,7 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
     private let lastSeqStorageKey = "DeviceLastSeqs"
     private let historyDirectoryName = "LactateHistory"
     private let historyIndexStorageKey = "LactateHistoryDeviceUUIDs"
+    private let legacyHistoryStorageKey = "LactateHistoryData"
     private let historyQueue = DispatchQueue(label: "de.copatec.LactateExpress.historyQueue", qos: .utility)
 
     private let targetServiceUUID = CBUUID(string: "8653000A-43E6-47B7-9CB0-5FC21D4AE340")
@@ -635,6 +636,7 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
 
     override init() {
         super.init()
+        removeLegacyHistoryBlobIfNeeded()
         central = CBCentralManager(delegate: self, queue: .main)
         loadActivationTimes()
         loadLastSeqs()
@@ -721,6 +723,13 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
             .filter { $0.deviceUUID == deviceUUID }
             .compactMap { $0.seq }
             .max()
+    }
+
+    private func removeLegacyHistoryBlobIfNeeded() {
+        let defaults = UserDefaults.standard
+        if defaults.object(forKey: legacyHistoryStorageKey) != nil {
+            defaults.removeObject(forKey: legacyHistoryStorageKey)
+        }
     }
 
     private func historyDirectoryURL() -> URL {
