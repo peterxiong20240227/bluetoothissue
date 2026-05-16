@@ -642,10 +642,10 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
                 let activation = Date().addingTimeInterval(-TimeInterval(seq) * interval.secondsPerSample)
                 self.activationTimes[deviceUUID] = activation
                 // Recompute timestamps for existing records for this device that have seq.
-                self.recomputeTimestamps(for: deviceUUID)
+                self.recomputeTimestamps(for: deviceUUID, deviceName: fullDeviceName)
             }
 
-            let timestamp = self.computeTimestamp(deviceUUID: deviceUUID, receiveTime: Date(), seq: seq)
+            let timestamp = self.computeTimestamp(deviceUUID: deviceUUID, deviceName: fullDeviceName, receiveTime: Date(), seq: seq)
 
             let point = DataPoint(
                 value: value,
@@ -661,8 +661,18 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
     // MARK: - Timestamp / Seq helpers
 
     private func deviceInterval(for deviceName: String) -> DeviceSampleInterval {
-        // TODO: adjust mapping to your actual names.
-        // Current assumption: lactate device names contain "Lac" or "Lact"; glucose otherwise.
+        // Mapping provided by you:
+        // - Lactate device name contains "CLM" (1 min)
+        // - Glucose device name contains "CGM" (3 min)
+        let upper = deviceName.uppercased()
+        if upper.contains("CLM") {
+            return .lactate1min
+        }
+        if upper.contains("CGM") {
+            return .glucose3min
+        }
+
+        // Fallback: keep previous heuristic if name doesn't include either.
         let lower = deviceName.lowercased()
         if lower.contains("lac") || lower.contains("lact") {
             return .lactate1min
@@ -670,23 +680,17 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
         return .glucose3min
     }
 
-    private func computeTimestamp(deviceUUID: String, receiveTime: Date, seq: Int?) -> Date {
+    private func computeTimestamp(deviceUUID: String, deviceName: String, receiveTime: Date, seq: Int?) -> Date {
         guard let seq, let activation = activationTimes[deviceUUID] else {
             return receiveTime
         }
-        // NOTE: currently uses lactate interval for all if we don't know device name here.
-        // We do have deviceName in caller; if needed pass in to computeTimestamp.
-        // For now infer interval from existing historyData deviceName if possible.
-        let name = historyData.last(where: { $0.deviceUUID == deviceUUID })?.deviceName ?? ""
-        let interval = deviceInterval(for: name)
+        let interval = deviceInterval(for: deviceName)
         return activation.addingTimeInterval(TimeInterval(seq) * interval.secondsPerSample)
     }
 
-    private func recomputeTimestamps(for deviceUUID: String) {
+    private func recomputeTimestamps(for deviceUUID: String, deviceName: String) {
         guard let activation = activationTimes[deviceUUID] else { return }
-        // Find device name for interval inference
-        let name = historyData.last(where: { $0.deviceUUID == deviceUUID })?.deviceName ?? ""
-        let interval = deviceInterval(for: name)
+        let interval = deviceInterval(for: deviceName)
 
         for idx in historyData.indices {
             guard historyData[idx].deviceUUID == deviceUUID else { continue }
@@ -696,33 +700,16 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
     }
 
     /// Parse seq16 from payload when present.
-    /// For packets like: eb 90 00 04 00 19 ... 19 5f ...
-    /// We locate the first occurrence of 0xeb 0x90 0x00 0x04 and then read seq at [12],[13] if length >= 14.
-    /// This is based on the sample you provided. If your format varies, we should refine this.
+    /// For packets like: eb9000040019090196195f0001...
+    /// This is currently a heuristic (seq at bytes[9..10]) based on samples you provided.
     private func parseSeq(from bytes: [UInt8]) -> Int? {
-        guard bytes.count >= 14 else { return nil }
-        // Quick check header.
-        if bytes[0] == 0xEB && bytes[1] == 0x90 {
-            // Empirically: seq bytes are around index 12..13 for 0x0019 realtime packets.
-            // Example: eb9000040019090196195f0001...
-            // indexes: 0 eb
-            // 1 90
-            // 2 00
-            // 3 04
-            // 4 00
-            // 5 19
-            // 6 09
-            // 7 01
-            // 8 96
-            // 9 19
-            // 10 5f
-            // In this example seq is at 9..10.
-            // But in current reader we treat 7..8 as value.
-            // So, implement a heuristic: if bytes[9..10] looks like a monotonically increasing seq (> 0x0100 typically), return it.
-            let candidate = Int(bytes[9]) * 256 + Int(bytes[10])
-            if candidate > 0 {
-                return candidate
-            }
+        guard bytes.count >= 11 else { return nil }
+        guard bytes[0] == 0xEB, bytes[1] == 0x90 else { return nil }
+
+        // Candidate: bytes[9..10] (big-endian)
+        let candidate = Int(bytes[9]) * 256 + Int(bytes[10])
+        if candidate > 0 {
+            return candidate
         }
         return nil
     }
