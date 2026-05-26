@@ -52,7 +52,11 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
         loadDeviceUUIDIndex()
         loadHistoryFromFilesAsync()
     }
-    func getAvailableDevices() -> [(uuid: String, name: String)] { Dictionary(grouping: historyData, by: \.deviceUUID).compactMap { $0.value.first.map { ($0.deviceUUID, $0.deviceName) } } }
+    func getAvailableDevices() -> [(uuid: String, name: String)] {
+        Dictionary(grouping: historyData, by: \.deviceUUID).compactMap {
+            $0.value.first.map { ($0.deviceUUID, $0.deviceName) }
+        }
+    }
     func nextMissingSeq(for deviceUUID: String) -> Int? {
         let seqs = historyData.filter { $0.deviceUUID == deviceUUID }.compactMap(\.seq).sorted()
         guard !seqs.isEmpty else { return nil }
@@ -66,9 +70,15 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
         activationTimes.removeValue(forKey: deviceUUID)
         deviceUUIDIndex.remove(deviceUUID)
         saveHistoryForDeviceAsync(deviceUUID)
-        lactate = "0.00 mmol/L"; rawData = "Waiting data..."; status = "History cleared for current device"
-        isBackfillingHistory = false; backfillStartSeq = nil; backfillTargetSeq = nil
-        lastRequestedHistorySeq = nil; lastReceivedHistorySeq = nil; backfillRetryCount = 0
+        lactate = "0.00 mmol/L"
+        rawData = "Waiting data..."
+        status = "History cleared for current device"
+        isBackfillingHistory = false
+        backfillStartSeq = nil
+        backfillTargetSeq = nil
+        lastRequestedHistorySeq = nil
+        lastReceivedHistorySeq = nil
+        backfillRetryCount = 0
     }
     func activationTimeForConnectedDevice() -> Date? { connectedPeripheralUUID.flatMap { activationTimes[$0] } }
     func setActivationTimeForConnectedDevice(_ date: Date) {
@@ -341,7 +351,11 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
         let hour = cal.component(.hour, from: date)
         let minute = cal.component(.minute, from: date)
         let second = cal.component(.second, from: date)
-        var payload: [UInt8] = [0xEB, 0x90, 0x00, 0x03, 0x00, 0x13, 0x01, 0x00, 0x00, 0x00, UInt8((year >> 8) & 0xFF), UInt8(year & 0xFF), UInt8(month & 0xFF), UInt8(day & 0xFF), UInt8(hour & 0xFF), UInt8(minute & 0xFF), UInt8(second & 0xFF), 0x00]
+        var payload: [UInt8] = [
+            0xEB, 0x90, 0x00, 0x03, 0x00, 0x13, 0x01, 0x00, 0x00, 0x00,
+            UInt8((year >> 8) & 0xFF), UInt8(year & 0xFF), UInt8(month & 0xFF), UInt8(day & 0xFF),
+            UInt8(hour & 0xFF), UInt8(minute & 0xFF), UInt8(second & 0xFF), 0x00,
+        ]
         let sum = checksum16(payload)
         payload.append(UInt8((sum >> 8) & 0xFF)); payload.append(UInt8(sum & 0xFF)); payload.append(0x0D); payload.append(0x0A)
         return payload
