@@ -12,6 +12,7 @@ import Foundation
 import SwiftUI
 import UIKit
 
+// swiftlint:disable file_length
 struct ClmReader: View {
     @StateObject private var ble = BLEManager.shared
     @State private var showExportSheet = false
@@ -36,9 +37,9 @@ struct ClmReader: View {
 
     private var chartYRange: ClosedRange<Float> {
         let values = displayData.map { $0.value }
-        guard !values.isEmpty else { return 0...10 }
+        guard !values.isEmpty else { return 0 ... 10 }
         let maxVal = values.max() ?? 10
-        return 0...(maxVal + 1)
+        return 0 ... (maxVal + 1)
     }
 
     var body: some View {
@@ -67,20 +68,6 @@ struct ClmReader: View {
                             .background(Color.purple)
                             .cornerRadius(8)
                     }
-
-                    Button {
-                        showClearHistoryAlert = true
-                    } label: {
-                        Text("Clear History")
-                            .font(.subheadline)
-                            .foregroundColor(.white)
-                            .padding(6)
-                            .background(Color.red)
-                            .cornerRadius(8)
-                    }
-                }
-
-                HStack(spacing: 10) {
                     Button {
                         manualActivationTime = ble.activationTimeForConnectedDevice() ?? Date()
                         showActivationTimeSheet = true
@@ -93,6 +80,19 @@ struct ClmReader: View {
                             .cornerRadius(8)
                     }
 
+//                    Button {
+//                        showClearHistoryAlert = true
+//                    } label: {
+//                        Text("Clear History")
+//                            .font(.subheadline)
+//                            .foregroundColor(.white)
+//                            .padding(6)
+//                            .background(Color.red)
+//                            .cornerRadius(8)
+//                    }
+                }
+
+                HStack(spacing: 10) {
                     Button {
                         showChartTimePicker = true
                     } label: {
@@ -261,7 +261,7 @@ struct ClmReader: View {
         } message: {
             Text("This will remove all stored history samples for the currently connected device.")
         }
-        .onChange(of: showExportSheet) { val in
+        .onChange(of: showExportSheet) { _, val in
             if !val && shouldExportAfterDismiss {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.7) {
                     exportAndShareDirectly()
@@ -271,13 +271,13 @@ struct ClmReader: View {
         .onReceive(ble.$historyData) { _ in
             rebuildDisplayData()
         }
-        .onChange(of: chartStartDate) { _ in
+        .onChange(of: chartStartDate) { _, _ in
             rebuildDisplayData()
         }
-        .onChange(of: chartEndDate) { _ in
+        .onChange(of: chartEndDate) { _, _ in
             rebuildDisplayData()
         }
-        .onChange(of: ble.connectedPeripheralUUID) { _ in
+        .onChange(of: ble.connectedPeripheralUUID) { _, _ in
             chartStartDate = Date().addingTimeInterval(-43200)
             chartEndDate = Date()
             endPinned = false
@@ -318,8 +318,8 @@ struct ClmReader: View {
 
         let header = "No,Device Name,Time,Seq,Lac Value(mmol/L)\n"
         var csv = header
-        for (i, item) in filtered.enumerated() {
-            csv += "\(i + 1),\(item.deviceName),\(item.timeStr),\(item.seq.map(String.init) ?? ""),\(String(format: "%.2f", item.value))\n"
+        for (idx, item) in filtered.enumerated() {
+            csv += "\(idx + 1),\(item.deviceName),\(item.timeStr),\(item.seq.map(String.init) ?? ""),\(String(format: "%.2f", item.value))\n"
         }
 
         let fileName = "Lactate_\(Date().timeIntervalSince1970).csv"
@@ -459,6 +459,10 @@ struct LactateChartView: View {
 struct LactateTableView: View {
     let data: [DataPoint]
 
+    func isRound(_ idx: Int) -> Bool {
+        idx.isMultiple(of: 2)
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             HStack {
@@ -478,6 +482,7 @@ struct LactateTableView: View {
             ScrollView {
                 LazyVStack(spacing: 0) {
                     ForEach(Array(data.reversed().enumerated()), id: \.element.id) { idx, item in
+                        let isRound = idx.isMultiple(of: 2)
                         HStack {
                             Text("\(idx + 1)")
                             Spacer()
@@ -490,8 +495,8 @@ struct LactateTableView: View {
                             Text(String(format: "%.2f", item.value))
                         }
                         .padding(.vertical, 8)
-                        .foregroundColor(idx % 2 == 0 ? .black : .white)
-                        .background(idx % 2 == 0 ? Color.white : Color(red: 0.1, green: 0.8, blue: 0.1))
+                        .foregroundColor(isRound ? .black : .white)
+                        .background(isRound ? Color.white : Color(red: 0.1, green: 0.8, blue: 0.1))
                     }
                 }
             }
@@ -574,9 +579,9 @@ struct DataPoint: Identifiable, Codable {
     }
 
     private static let formatter: DateFormatter = {
-        let f = DateFormatter()
-        f.dateFormat = "MM-dd HH:mm"
-        return f
+        let formatter = DateFormatter()
+        formatter.dateFormat = "MM-dd HH:mm"
+        return formatter
     }()
 
     var timeStr: String { Self.formatter.string(from: timestamp) }
@@ -604,8 +609,8 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
     @Published var historyData: [DataPoint] = []
     @Published var foundDevices: [CBPeripheral] = []
 
-    @Published var connectedPeripheralUUID: String? = nil
-    @Published var connectedPeripheralName: String? = nil
+    @Published var connectedPeripheralUUID: String?
+    @Published var connectedPeripheralName: String?
 
     private var central: CBCentralManager!
     private var notifyPeripheral: CBPeripheral?
@@ -627,10 +632,10 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
     private var didTriggerInitialSyncForCurrentConnection = false
 
     private var isBackfillingHistory = false
-    private var backfillStartSeq: Int? = nil
-    private var backfillTargetSeq: Int? = nil
-    private var lastRequestedHistorySeq: Int? = nil
-    private var lastReceivedHistorySeq: Int? = nil
+    private var backfillStartSeq: Int?
+    private var backfillTargetSeq: Int?
+    private var lastRequestedHistorySeq: Int?
+    private var lastReceivedHistorySeq: Int?
     private var backfillRetryCount = 0
     private let maxBackfillRetryCount = 3
 
@@ -660,7 +665,7 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
 
         guard !seqs.isEmpty else { return nil }
 
-        for idx in 1..<seqs.count {
+        for idx in 1 ..< seqs.count {
             let prev = seqs[idx - 1]
             let current = seqs[idx]
             if current > prev + 1 {
@@ -707,7 +712,7 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
     private func firstMissingSeq(in sortedSeqs: [Int]) -> Int? {
         guard !sortedSeqs.isEmpty else { return nil }
 
-        for idx in 1..<sortedSeqs.count {
+        for idx in 1 ..< sortedSeqs.count {
             let prev = sortedSeqs[idx - 1]
             let current = sortedSeqs[idx]
             if current > prev + 1 {
@@ -891,7 +896,7 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
         status = central.state == .poweredOn ? "Bluetooth ON → Ready" : "Bluetooth NOT Available"
     }
 
-    func centralManager(_ central: CBCentralManager, didDiscover peripheral: CBPeripheral, advertisementData: [String : Any], rssi RSSI: NSNumber) {
+    func centralManager(_ central: CBCentralManager, didDiscover peripheral: CBPeripheral, advertisementData: [String: Any], rssi RSSI: NSNumber) {
         guard let name = peripheral.name, !name.isEmpty else { return }
         if name.starts(with: "Eaglenos") {
             if !foundDevices.contains(where: { $0.identifier == peripheral.identifier }) {
@@ -926,8 +931,8 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
         guard let services = peripheral.services else {
             return
         }
-        for s in services where s.uuid == targetServiceUUID {
-            peripheral.discoverCharacteristics([notifyCharUUID, writeCharUUID], for: s)
+        for service in services where service.uuid == targetServiceUUID {
+            peripheral.discoverCharacteristics([notifyCharUUID, writeCharUUID], for: service)
         }
     }
 
@@ -940,13 +945,13 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
             return
         }
 
-        for c in chars {
-            if c.uuid == notifyCharUUID {
-                notifyCharacteristic = c
-                peripheral.setNotifyValue(true, for: c)
+        for char in chars {
+            if char.uuid == notifyCharUUID {
+                notifyCharacteristic = char
+                peripheral.setNotifyValue(true, for: char)
             }
-            if c.uuid == writeCharUUID {
-                writeCharacteristic = c
+            if char.uuid == writeCharUUID {
+                writeCharacteristic = char
             }
         }
 
@@ -1005,7 +1010,7 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
 
     private func isRealtimePacket(_ bytes: [UInt8]) -> Bool {
         guard bytes.count >= 6 else { return false }
-        guard bytes[0] == 0xEB, bytes[1] == 0x90, bytes[2] == 0x00, bytes[3] == 0x04 else { return false }
+        guard bytes[0] == 0xEB, bytes[1] == 0x90, bytes[2] == 0x00, bytes[4] == 0x00, bytes[5] == 0x19, bytes[6] == 0x09 else { return false }
         let len = Int(bytes[4]) << 8 | Int(bytes[5])
         return len == 0x0019
     }
@@ -1058,9 +1063,9 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
         guard recordCount > 0 else { return }
 
         var points: [DataPoint] = []
-        for i in 0..<recordCount {
-            let start = i * recordSize
-            let rec = Array(body[start..<(start + recordSize)])
+        for idx in 0 ..< recordCount {
+            let start = idx * recordSize
+            let rec = Array(body[start ..< (start + recordSize)])
 
             let seq = Int(rec[0]) * 256 + Int(rec[1])
             let rawValue = Int(rec[14]) * 256 + Int(rec[15])
@@ -1077,8 +1082,8 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
             self.connectedPeripheralName = deviceName
             self.status = "Receiving history data..."
 
-            for p in points {
-                self.upsert(p)
+            for point in points {
+                self.upsert(point)
             }
 
             guard self.isBackfillingHistory else { return }
@@ -1222,7 +1227,7 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
             UInt8((year >> 8) & 0xFF), UInt8(year & 0xFF),
             UInt8(month & 0xFF), UInt8(day & 0xFF),
             UInt8(hour & 0xFF), UInt8(minute & 0xFF), UInt8(second & 0xFF),
-            0x00
+            0x00,
         ]
 
         let sum = checksum16(payload)
@@ -1237,7 +1242,7 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
         var payload: [UInt8] = [
             0xEB, 0x90, 0x00, 0x04, 0x00, 0x0D,
             0x07, 0x00, 0x00,
-            UInt8((startSeq >> 8) & 0xFF), UInt8(startSeq & 0xFF)
+            UInt8((startSeq >> 8) & 0xFF), UInt8(startSeq & 0xFF),
         ]
 
         let sum = checksum16(payload)
@@ -1251,7 +1256,7 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
     private func buildHistoryStreamStartPacket() -> [UInt8] {
         var payload: [UInt8] = [
             0xEB, 0x90, 0x00, 0x06, 0x00, 0x0D,
-            0x07, 0x00, 0x00, 0x00, 0x01
+            0x07, 0x00, 0x00, 0x00, 0x01,
         ]
         let sum = checksum16(payload)
         payload.append(UInt8((sum >> 8) & 0xFF))
@@ -1309,5 +1314,5 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
 }
 
 #Preview {
-    ContentView()
+    ClmReader()
 }
