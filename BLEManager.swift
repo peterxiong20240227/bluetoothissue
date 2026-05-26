@@ -107,12 +107,18 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
         if defaults.object(forKey: legacyHistoryStorageKey) != nil { defaults.removeObject(forKey: legacyHistoryStorageKey) }
     }
     private func historyDirectoryURL() -> URL {
-        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first ?? FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
+        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+            ?? FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
         let dir = base.appendingPathComponent(historyDirectoryName, isDirectory: true)
-        if !FileManager.default.fileExists(atPath: dir.path) { try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true) }
+        if !FileManager.default.fileExists(atPath: dir.path) {
+            try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        }
         return dir
     }
-    private func historyFileURL(for deviceUUID: String) -> URL { historyDirectoryURL().appendingPathComponent("\(deviceUUID.replacingOccurrences(of: "/", with: "_")).json") }
+    private func historyFileURL(for deviceUUID: String) -> URL {
+        let safe = deviceUUID.replacingOccurrences(of: "/", with: "_")
+        return historyDirectoryURL().appendingPathComponent("\(safe).json")
+    }
     private func saveDeviceUUIDIndex() { UserDefaults.standard.set(Array(deviceUUIDIndex).sorted(), forKey: historyIndexStorageKey) }
     private func loadDeviceUUIDIndex() { deviceUUIDIndex = Set(UserDefaults.standard.stringArray(forKey: historyIndexStorageKey) ?? []) }
     private func loadHistoryFromFilesAsync() {
@@ -120,7 +126,8 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
             var loaded: [DataPoint] = []
             for uuid in self.deviceUUIDIndex {
                 let url = self.historyFileURL(for: uuid)
-                guard let data = try? Data(contentsOf: url), let arr = try? JSONDecoder().decode([DataPoint].self, from: data) else { continue }
+                guard let data = try? Data(contentsOf: url),
+                      let arr = try? JSONDecoder().decode([DataPoint].self, from: data) else { continue }
                 loaded.append(contentsOf: arr)
             }
             loaded.sort { $0.timestamp < $1.timestamp }
@@ -145,14 +152,20 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
             try? data.write(to: url, options: [.atomic])
         }
     }
-    private func saveActivationTimes() { UserDefaults.standard.set(activationTimes.mapValues { $0.timeIntervalSince1970 }, forKey: activationStorageKey) }
+    private func saveActivationTimes() {
+        UserDefaults.standard.set(activationTimes.mapValues { $0.timeIntervalSince1970 }, forKey: activationStorageKey)
+    }
     private func loadActivationTimes() {
         guard let dict = UserDefaults.standard.dictionary(forKey: activationStorageKey) as? [String: TimeInterval] else { return }
         activationTimes = dict.mapValues { Date(timeIntervalSince1970: $0) }
     }
     private func saveLastSeqs() { UserDefaults.standard.set(lastSeqs, forKey: lastSeqStorageKey) }
     private func loadLastSeqs() { if let dict = UserDefaults.standard.dictionary(forKey: lastSeqStorageKey) as? [String: Int] { lastSeqs = dict } }
-    func startScan() { foundDevices.removeAll(); status = "Scanning..."; central.scanForPeripherals(withServices: nil, options: [CBCentralManagerScanOptionAllowDuplicatesKey: false]) }
+    func startScan() {
+        foundDevices.removeAll()
+        status = "Scanning..."
+        central.scanForPeripherals(withServices: nil, options: [CBCentralManagerScanOptionAllowDuplicatesKey: false])
+    }
     func connect(_ peripheral: CBPeripheral) {
         central.stopScan()
         connectedPeripheralUUID = peripheral.identifier.uuidString
@@ -180,12 +193,17 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { self.requestHistoryPage(from: beginSeq) }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { self.sendHistoryStreamStart() }
     }
-    func centralManagerDidUpdateState(_ central: CBCentralManager) { status = central.state == .poweredOn ? "Bluetooth ON → Ready" : "Bluetooth NOT Available" }
+    func centralManagerDidUpdateState(_ central: CBCentralManager) {
+        status = central.state == .poweredOn ? "Bluetooth ON → Ready" : "Bluetooth NOT Available"
+    }
     func centralManager(_ central: CBCentralManager, didDiscover peripheral: CBPeripheral, advertisementData: [String: Any], rssi RSSI: NSNumber) {
         guard let name = peripheral.name, !name.isEmpty, name.starts(with: "Eaglenos") else { return }
         if !foundDevices.contains(where: { $0.identifier == peripheral.identifier }) { foundDevices.append(peripheral) }
     }
-    func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) { status = "Connected: \(peripheral.name ?? "Device")"; peripheral.discoverServices([targetServiceUUID]) }
+    func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
+        status = "Connected: \(peripheral.name ?? "Device")"
+        peripheral.discoverServices([targetServiceUUID])
+    }
     func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?) {
         if connectedPeripheralUUID == peripheral.identifier.uuidString {
             connectedPeripheralUUID = nil; connectedPeripheralName = nil
@@ -197,7 +215,9 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
     func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
         if let error { status = "Discover services error: \(error.localizedDescription)"; return }
         guard let services = peripheral.services else { return }
-        for service in services where service.uuid == targetServiceUUID { peripheral.discoverCharacteristics([notifyCharUUID, writeCharUUID], for: service) }
+        for service in services where service.uuid == targetServiceUUID {
+            peripheral.discoverCharacteristics([notifyCharUUID, writeCharUUID], for: service)
+        }
     }
     func peripheral(_ peripheral: CBPeripheral, didDiscoverCharacteristicsFor service: CBService, error: Error?) {
         if let error { status = "Discover chars error: \(error.localizedDescription)"; return }
@@ -213,7 +233,9 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
         status = characteristic.isNotifying ? "Notify ON" : "Notify OFF"
         triggerInitialHistorySyncIfReady()
     }
-    func peripheral(_ peripheral: CBPeripheral, didWriteValueFor characteristic: CBCharacteristic, error: Error?) { if let error { status = "Write failed: \(error.localizedDescription)" } }
+    func peripheral(_ peripheral: CBPeripheral, didWriteValueFor characteristic: CBCharacteristic, error: Error?) {
+        if let error { status = "Write failed: \(error.localizedDescription)" }
+    }
     func peripheral(_ peripheral: CBPeripheral, didUpdateValueFor characteristic: CBCharacteristic, error: Error?) {
         guard error == nil, characteristic.uuid == notifyCharacteristic?.uuid, let data = characteristic.value else { return }
         let byteArray = [UInt8](data)
@@ -233,7 +255,8 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
         return type == 0x0004 && (len == 0x00D9 || len == 0x0039)
     }
     private func isRealtimePacket(_ bytes: [UInt8]) -> Bool {
-        guard bytes.count >= 6, bytes[0] == 0xEB, bytes[1] == 0x90, bytes[2] == 0x00, bytes[4] == 0x00, bytes[5] == 0x19, bytes[6] == 0x09 else { return false }
+        guard bytes.count >= 6, bytes[0] == 0xEB, bytes[1] == 0x90, bytes[2] == 0x00,
+              bytes[4] == 0x00, bytes[5] == 0x19, bytes[6] == 0x09 else { return false }
         return (Int(bytes[4]) << 8 | Int(bytes[5])) == 0x0019
     }
     private func handleRealtimePacket(_ bytes: [UInt8], deviceName: String, deviceUUID: String) {
@@ -285,7 +308,9 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
             guard let pageMaxSeq else { self.isBackfillingHistory = false; self.status = "History sync stopped"; return }
             if let lastRequested = self.lastRequestedHistorySeq, pageMaxSeq < lastRequested {
                 self.backfillRetryCount += 1
-                if self.backfillRetryCount > self.maxBackfillRetryCount { self.isBackfillingHistory = false; self.status = "History sync stopped"; return }
+                if self.backfillRetryCount > self.maxBackfillRetryCount {
+                    self.isBackfillingHistory = false; self.status = "History sync stopped"; return
+                }
                 self.requestHistoryPage(from: lastRequested)
                 return
             }
@@ -316,9 +341,19 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
         status = "Realtime gap detected, syncing history from seq \(missingStartSeq)"
         manualSyncHistory(startSeq: missingStartSeq)
     }
-    private func requestHistoryPage(from startSeq: Int) { lastRequestedHistorySeq = startSeq; sendHistoryRequest(startSeqOverride: startSeq) }
+    private func requestHistoryPage(from startSeq: Int) {
+        lastRequestedHistorySeq = startSeq
+        sendHistoryRequest(startSeqOverride: startSeq)
+    }
     private func triggerInitialHistorySyncIfReady() {
-        guard !didTriggerInitialSyncForCurrentConnection, let peripheral = notifyPeripheral, let notifyCharacteristic, let writeCharacteristic, notifyCharacteristic.isNotifying, peripheral.state == .connected else { return }
+        guard !didTriggerInitialSyncForCurrentConnection,
+              let peripheral = notifyPeripheral,
+              let notifyCharacteristic,
+              let writeCharacteristic,
+              notifyCharacteristic.isNotifying,
+              peripheral.state == .connected else {
+            return
+        }
         _ = writeCharacteristic
         didTriggerInitialSyncForCurrentConnection = true
         status = "Connected and ready"
@@ -357,19 +392,25 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
             UInt8(hour & 0xFF), UInt8(minute & 0xFF), UInt8(second & 0xFF), 0x00,
         ]
         let sum = checksum16(payload)
-        payload.append(UInt8((sum >> 8) & 0xFF)); payload.append(UInt8(sum & 0xFF)); payload.append(0x0D); payload.append(0x0A)
+        payload.append(UInt8((sum >> 8) & 0xFF)); payload.append(UInt8(sum & 0xFF))
+        payload.append(0x0D); payload.append(0x0A)
         return payload
     }
     private func buildHistoryRequestPacket(startSeq: Int) -> [UInt8] {
-        var payload: [UInt8] = [0xEB, 0x90, 0x00, 0x04, 0x00, 0x0D, 0x07, 0x00, 0x00, UInt8((startSeq >> 8) & 0xFF), UInt8(startSeq & 0xFF)]
+        var payload: [UInt8] = [
+            0xEB, 0x90, 0x00, 0x04, 0x00, 0x0D, 0x07, 0x00, 0x00,
+            UInt8((startSeq >> 8) & 0xFF), UInt8(startSeq & 0xFF),
+        ]
         let sum = checksum16(payload)
-        payload.append(UInt8((sum >> 8) & 0xFF)); payload.append(UInt8(sum & 0xFF)); payload.append(0x0D); payload.append(0x0A)
+        payload.append(UInt8((sum >> 8) & 0xFF)); payload.append(UInt8(sum & 0xFF))
+        payload.append(0x0D); payload.append(0x0A)
         return payload
     }
     private func buildHistoryStreamStartPacket() -> [UInt8] {
         var payload: [UInt8] = [0xEB, 0x90, 0x00, 0x06, 0x00, 0x0D, 0x07, 0x00, 0x00, 0x00, 0x01]
         let sum = checksum16(payload)
-        payload.append(UInt8((sum >> 8) & 0xFF)); payload.append(UInt8(sum & 0xFF)); payload.append(0x0D); payload.append(0x0A)
+        payload.append(UInt8((sum >> 8) & 0xFF)); payload.append(UInt8(sum & 0xFF))
+        payload.append(0x0D); payload.append(0x0A)
         return payload
     }
     private func checksum16(_ bytes: [UInt8]) -> UInt16 { bytes.reduce(0) { ($0 + UInt16($1)) & 0xFFFF } }
@@ -393,5 +434,8 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
             historyData[idx].timestamp = activation.addingTimeInterval(TimeInterval(seq) * interval.secondsPerSample)
         }
     }
-    private func parseRealtimeSeq(from bytes: [UInt8]) -> Int? { guard isRealtimePacket(bytes), bytes.count >= 11 else { return nil }; return Int(bytes[9]) * 256 + Int(bytes[10]) }
+    private func parseRealtimeSeq(from bytes: [UInt8]) -> Int? {
+        guard isRealtimePacket(bytes), bytes.count >= 11 else { return nil }
+        return Int(bytes[9]) * 256 + Int(bytes[10])
+    }
 }
